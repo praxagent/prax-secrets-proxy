@@ -186,3 +186,153 @@ def test_audit_log_never_contains_the_key_or_body(proxy, caplog):
     assert "/v1/chat/completions" in logged
     assert REAL_OPENAI not in logged
     assert "hunter2" not in logged
+
+
+# ---------------------------------------------------------------------------
+# Silent-failure invariants (docs/research/failure-atlas-llm-gateways.md).
+#
+# A proxy's most dangerous failures are SILENT — HTTP 200 with a corrupted
+# payload. The proxy's defense against the worst class (State/Session: context
+# bleeding, cross-request credential leakage, races) is that it holds NO
+# per-request mutable state — it's stateless pass-through. These tests pin that
+# invariant so a future change can't quietly reintroduce shared state, and pin
+# that a truncated upstream is surfaced, never silently completed.
+# ---------------------------------------------------------------------------
+
+class _RecordingUpstream:
+    """Fake upstream that records the exact headers/body it was called with."""
+
+    def __init__(self, sink, status=200, chunks=(b"ok",)):
+        self._sink = sink
+        self.status_code = status
+        self.headers = {"Content-Type": "text/event-stream"}
+        self._chunks = chunks
+        self.closed = False
+
+    def iter_content(self, chunk_size=8192):
+        yield from self._chunks
+
+    def close(self):
+        self.closed = True
+
+
+@pytest.fixture()
+def recording_proxy(monkeypatch):
+    """Proxy whose upstream records EVERY call (thread-safe), not just the last."""
+    import threading
+    monkeypatch.setenv("OPENAI_KEY", REAL_OPENAI)
+    monkeypatch.setenv("ANTHROPIC_KEY", REAL_ANTHROPIC)
+    calls = []
+    lock = threading.Lock()
+
+    def fake_request(method, url, headers=None, data=None, **kw):
+        rec = {"url": url, "headers": dict(headers or {}), "data": data}
+        with lock:
+            calls.append(rec)
+        return _RecordingUpstream(rec)
+
+    monkeypatch.setattr("secrets_proxy.app.requests.request", fake_request)
+    app = build_proxy_app(ProxyConfig())
+    return app, calls
+
+
+def test_interleaved_requests_never_bleed_credentials(recording_proxy):
+    """openai and anthropic requests interleaved must each inject only their OWN
+    key — no request ever sees the other provider's credential (context bleeding)."""
+    app, calls = recording_proxy
+    client = app.test_client()
+    for _ in range(5):
+        client.post("/openai/v1/chat/completions", json={})
+        client.post("/anthropic/v1/messages", json={})
+
+    openai_calls = [c for c in calls if "openai.com" in c["url"]]
+    anthropic_calls = [c for c in calls if "anthropic.com" in c["url"]]
+    assert len(openai_calls) == 5 and len(anthropic_calls) == 5
+    for c in openai_calls:
+        assert c["headers"].get("Authorization") == f"Bearer {REAL_OPENAI}"
+        assert REAL_ANTHROPIC not in str(c["headers"])          # no cross-bleed
+        assert "x-api-key" not in c["headers"]
+    for c in anthropic_calls:
+        assert c["headers"].get("x-api-key") == REAL_ANTHROPIC
+        assert REAL_OPENAI not in str(c["headers"])              # no cross-bleed
+
+
+def test_concurrent_requests_stay_isolated(recording_proxy):
+    """Under real concurrency, each request's injected key matches its provider —
+    proving the proxy holds no shared per-request state (race-condition immunity)."""
+    import threading
+    app, calls = recording_proxy
+
+    def hit(provider):
+        # Fresh test_client per thread; the app itself must carry no request state.
+        c = app.test_client()
+        if provider == "openai":
+            c.post("/openai/v1/chat/completions", json={})
+        else:
+            c.post("/anthropic/v1/messages", json={})
+
+    threads = [threading.Thread(target=hit, args=("openai" if i % 2 == 0 else "anthropic",))
+               for i in range(20)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    assert len(calls) == 20
+    # Every recorded call is internally consistent: the injected credential
+    # matches the provider in its URL. A shared-state race would mismatch these.
+    for c in calls:
+        if "openai.com" in c["url"]:
+            assert c["headers"].get("Authorization") == f"Bearer {REAL_OPENAI}"
+            assert "x-api-key" not in c["headers"]
+        else:
+            assert c["headers"].get("x-api-key") == REAL_ANTHROPIC
+            assert "Authorization" not in c["headers"]
+
+
+def test_request_body_is_not_shared_between_calls(recording_proxy):
+    """Each proxied call forwards its OWN body — no leftover state from a prior one."""
+    app, calls = recording_proxy
+    client = app.test_client()
+    client.post("/openai/v1/chat/completions", data=b"FIRST-BODY")
+    client.post("/openai/v1/chat/completions", data=b"SECOND-BODY")
+    assert calls[0]["data"] == b"FIRST-BODY"
+    assert calls[1]["data"] == b"SECOND-BODY"
+
+
+def test_truncated_upstream_stream_is_surfaced_not_silently_completed(monkeypatch):
+    """A mid-stream upstream failure must NOT be swallowed into a clean 200 body.
+
+    The proxy streams pass-through, so a dropped upstream surfaces as a truncated
+    client stream (the transport error propagates) — it never fabricates a
+    complete-looking response, which would be the classic silent-200 corruption.
+    """
+    import requests
+
+    monkeypatch.setenv("OPENAI_KEY", REAL_OPENAI)
+
+    class _TruncatingUpstream:
+        status_code = 200
+        headers = {"Content-Type": "text/event-stream"}
+
+        def iter_content(self, chunk_size=8192):
+            yield b'data: {"partial":1}\n\n'
+            raise requests.exceptions.ChunkedEncodingError("upstream dropped mid-stream")
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr("secrets_proxy.app.requests.request",
+                        lambda *a, **k: _TruncatingUpstream())
+    client = build_proxy_app(ProxyConfig()).test_client()
+
+    raised = False
+    body = b""
+    try:
+        resp = client.post("/openai/v1/chat/completions", json={})
+        body = resp.get_data()
+    except requests.exceptions.ChunkedEncodingError:
+        raised = True
+    # Either the error propagated, or only the partial chunk was delivered — but
+    # NEVER a clean body with a fabricated completion the upstream never sent.
+    assert raised or (b"partial" in body and b"[DONE]" not in body)
