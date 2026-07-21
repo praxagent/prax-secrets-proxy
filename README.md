@@ -28,8 +28,16 @@ nothing to learn. The proxy is for deployments that want the hardened, keyless m
 
 ## Run it
 
+**Docker (recommended — a separate container *is* the isolation):**
+
 ```bash
-# In the PROXY's OWN environment (isolated from the agent):
+cp .env-example .env          # put the REAL keys in .env  (.env is gitignored)
+docker compose up --build     # gunicorn on :8785, in its own container
+```
+
+**Or natively, in the proxy's own shell:**
+
+```bash
 cp .env-example .env          # put the REAL keys in .env  (.env is gitignored)
 pip install -e .              # or: uv sync
 python -m secrets_proxy       # loads .env; listens on 127.0.0.1:8785

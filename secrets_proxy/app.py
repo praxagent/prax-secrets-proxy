@@ -37,8 +37,13 @@ def _response_headers(upstream_headers) -> list[tuple[str, str]]:
 
 
 def build_proxy_app(config: ProxyConfig | None = None) -> Flask:
-    """Build the Flask app for the secrets proxy."""
-    cfg = config or ProxyConfig()
+    """Build the Flask app for the secrets proxy.
+
+    With no explicit *config*, reads settings from the environment (``from_env``)
+    so the gunicorn app-factory (``secrets_proxy.app:build_proxy_app()``) honors
+    PROXY_* overrides without a wrapper.
+    """
+    cfg = config or ProxyConfig.from_env()
     app = Flask("prax-secrets-proxy")
 
     def _audit(line: str) -> None:

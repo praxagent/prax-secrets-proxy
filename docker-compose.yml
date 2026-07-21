@@ -1,0 +1,34 @@
+# Run the secrets proxy as its own isolated container — the endorsed shape, since
+# real isolation is the agent's process being unable to reach this container's env
+# or filesystem. The REAL keys live only in this repo's gitignored `.env`.
+#
+#   cp .env-example .env      # put the REAL keys in .env
+#   docker compose up --build
+#
+# Then point a KEYLESS agent at http://<host>:8785/openai and /anthropic with
+# PLACEHOLDER keys. See README.md.
+name: prax-secrets-proxy
+
+services:
+  secrets-proxy:
+    build:
+      context: .
+    image: prax-secrets-proxy:latest
+    restart: unless-stopped
+    # The ONLY place the real keys are read. This file is gitignored.
+    env_file: .env
+    environment:
+      - PROXY_HOST=0.0.0.0
+      - PROXY_PORT=8785
+    ports:
+      # Loopback-published by default — unauthenticated by design, so reachability
+      # is the control. Drop the "127.0.0.1:" prefix (or attach to a private
+      # network) only when a remote keyless agent must reach it.
+      - "127.0.0.1:8785:8785"
+    healthcheck:
+      test: ["CMD", "python", "-c",
+             "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:8785/healthz').status==200 else 1)"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
