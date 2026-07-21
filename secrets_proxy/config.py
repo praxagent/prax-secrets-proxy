@@ -68,6 +68,21 @@ class ProxyConfig:
     # NEVER the key or body). Empty = log to the module logger only.
     audit_log_path: str | None = field(
         default_factory=lambda: os.environ.get("PROXY_AUDIT_LOG") or None)
+    # Shared bearer token the CLIENT must present (so only the authorised agent —
+    # not any other process that can reach the port — can spend the keys). The
+    # client sends it in the NORMAL auth slot (Authorization: Bearer / x-api-key);
+    # the proxy validates it (constant-time), then STRIPS it and injects the real
+    # provider key. Empty = open (loopback/back-compat) — a startup warning fires.
+    auth_token: str | None = field(
+        default_factory=lambda: os.environ.get("PROXY_AUTH_TOKEN") or None)
+    # Optional TLS so the token + traffic aren't exchanged in plaintext across a
+    # wire. Point both at a cert/key (self-signed is fine — the client trusts it
+    # via SSL_CERT_FILE). Empty = plain HTTP (fine on loopback, which never hits a
+    # wire; use TLS or a tunnel for anything cross-host).
+    tls_cert: str | None = field(
+        default_factory=lambda: os.environ.get("PROXY_TLS_CERT") or None)
+    tls_key: str | None = field(
+        default_factory=lambda: os.environ.get("PROXY_TLS_KEY") or None)
 
     @classmethod
     def from_env(cls) -> ProxyConfig:
@@ -76,3 +91,10 @@ class ProxyConfig:
             port=int(os.environ.get("PROXY_PORT", "8785")),
             timeout=float(os.environ.get("PROXY_TIMEOUT_S", "600")),
         )
+
+    @property
+    def tls_context(self) -> tuple[str, str] | None:
+        """(cert, key) for an ssl_context, or None when TLS isn't configured."""
+        if self.tls_cert and self.tls_key:
+            return (self.tls_cert, self.tls_key)
+        return None

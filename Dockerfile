@@ -12,13 +12,15 @@ COPY pyproject.toml README.md ./
 COPY secrets_proxy ./secrets_proxy
 RUN pip install --no-cache-dir '.[prod]'
 
+COPY docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
+RUN chmod +x /usr/local/bin/docker-entrypoint.sh
+
 USER proxy
 
-# Loopback INSIDE the container; publish/attach to a network deliberately. The
-# proxy is unauthenticated by design — reachability is the control.
 ENV PROXY_HOST=0.0.0.0 PROXY_PORT=8785
 EXPOSE 8785
 
-# Real WSGI server, threaded so streaming responses don't block a worker.
-CMD ["gunicorn", "-k", "gthread", "-w", "4", "--threads", "8", \
-     "-b", "0.0.0.0:8785", "secrets_proxy.app:build_proxy_app()"]
+# Entrypoint runs gunicorn, adding TLS when PROXY_TLS_CERT/KEY are set and the
+# token (PROXY_AUTH_TOKEN) is enforced in-app. Real WSGI server, threaded so
+# streaming responses don't block a worker.
+ENTRYPOINT ["/usr/local/bin/docker-entrypoint.sh"]

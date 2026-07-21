@@ -9,6 +9,7 @@ Security properties this app must preserve (tested in tests/test_secrets_proxy.p
 """
 from __future__ import annotations
 
+import hmac
 import logging
 
 import requests
@@ -17,6 +18,19 @@ from flask import Flask, Response, request, stream_with_context
 from secrets_proxy.config import ProxyConfig
 
 logger = logging.getLogger("secrets_proxy")
+
+
+def _presented_token(headers) -> str | None:
+    """The bearer token the client presented, from the normal auth slot.
+
+    Reads ``Authorization: Bearer <t>`` (OpenAI-style) or ``x-api-key: <t>``
+    (Anthropic-style) — whichever the client's model SDK used to send its key.
+    """
+    authz = headers.get("Authorization", "")
+    if authz.lower().startswith("bearer "):
+        return authz[7:].strip() or None
+    xkey = headers.get("x-api-key")
+    return xkey.strip() if xkey else None
 
 # Hop-by-hop headers must not be forwarded (RFC 7230 §6.1). Host/Content-Length
 # are recomputed by requests; the rest are connection-scoped.
@@ -64,6 +78,14 @@ def build_proxy_app(config: ProxyConfig | None = None) -> Flask:
     @app.route("/<provider>/<path:path>",
                methods=["GET", "POST", "PUT", "PATCH", "DELETE"])
     def proxy(provider: str, path: str):
+        # Auth first: an unauthenticated caller learns nothing (not even whether a
+        # provider exists). Constant-time compare so the token can't be timed out.
+        if cfg.auth_token:
+            presented = _presented_token(request.headers) or ""
+            if not hmac.compare_digest(presented, cfg.auth_token):
+                _audit(f"401 {provider} /{path} (bad or missing proxy token)")
+                return {"error": "unauthorized: valid proxy token required"}, 401
+
         up = cfg.upstreams.get(provider)
         if up is None:  # allowlist: unknown provider is never forwarded
             return {"error": f"unknown provider {provider!r}"}, 404

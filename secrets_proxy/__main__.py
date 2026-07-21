@@ -38,13 +38,23 @@ def main() -> None:
         logging.getLogger("secrets_proxy").debug("no %s loaded", env_file)
     cfg = ProxyConfig.from_env()
     app = build_proxy_app(cfg)
+    log = logging.getLogger("secrets_proxy")
     have = [n for n, up in cfg.upstreams.items() if up.real_key()]
-    logging.getLogger("secrets_proxy").info(
-        "listening on %s:%d — keys present for: %s",
-        cfg.host, cfg.port, ", ".join(have) or "(none — set OPENAI_KEY/ANTHROPIC_KEY)")
+    scheme = "https" if cfg.tls_context else "http"
+    log.info("listening on %s://%s:%d — keys present for: %s",
+             scheme, cfg.host, cfg.port,
+             ", ".join(have) or "(none — set OPENAI_KEY/ANTHROPIC_KEY)")
+    if not cfg.auth_token:
+        log.warning("PROXY_AUTH_TOKEN is not set — the proxy is OPEN to anyone who "
+                    "can reach the port. Set it (and require it from the agent) "
+                    "unless you fully trust reachability (e.g. loopback only).")
+    if not cfg.tls_context and cfg.host not in ("127.0.0.1", "localhost", "::1"):
+        log.warning("Serving plain HTTP on a non-loopback address — the token and "
+                    "traffic cross the wire in plaintext. Set PROXY_TLS_CERT/"
+                    "PROXY_TLS_KEY (see scripts/gen-cert.sh) or use a tunnel.")
     # threaded=True so streaming responses don't block other requests. For prod,
     # front with gunicorn: `gunicorn -k gthread 'secrets_proxy.app:build_proxy_app()'`.
-    app.run(host=cfg.host, port=cfg.port, threaded=True)
+    app.run(host=cfg.host, port=cfg.port, threaded=True, ssl_context=cfg.tls_context)
 
 
 if __name__ == "__main__":

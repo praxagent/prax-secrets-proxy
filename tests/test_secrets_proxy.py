@@ -118,6 +118,65 @@ def test_healthz_reports_readiness_without_values(proxy):
     assert REAL_OPENAI not in str(j)
 
 
+@pytest.fixture()
+def authed_proxy(monkeypatch):
+    """A proxy that REQUIRES the shared token PROXY_AUTH_TOKEN."""
+    monkeypatch.setenv("OPENAI_KEY", REAL_OPENAI)
+    monkeypatch.setenv("ANTHROPIC_KEY", REAL_ANTHROPIC)
+    monkeypatch.setenv("PROXY_AUTH_TOKEN", "PROXY-SHARED-TOKEN")
+    captured = {}
+
+    def fake_request(method, url, headers=None, data=None, **kw):
+        captured.update(method=method, url=url, headers=headers or {}, data=data)
+        return _FakeUpstream()
+
+    monkeypatch.setattr("secrets_proxy.app.requests.request", fake_request)
+    from secrets_proxy.config import ProxyConfig as _Cfg
+    app = build_proxy_app(_Cfg.from_env())
+    return app.test_client(), captured
+
+
+def test_auth_missing_token_is_401_never_forwarded(authed_proxy):
+    client, captured = authed_proxy
+    r = client.post("/openai/v1/chat/completions", json={})
+    assert r.status_code == 401
+    assert captured == {}  # nothing spent
+
+
+def test_auth_wrong_token_is_401(authed_proxy):
+    client, captured = authed_proxy
+    r = client.post("/openai/v1/chat/completions",
+                    headers={"Authorization": "Bearer WRONG"}, json={})
+    assert r.status_code == 401
+    assert captured == {}
+
+
+def test_auth_correct_bearer_token_passes_and_is_swapped_for_real_key(authed_proxy):
+    client, captured = authed_proxy
+    r = client.post("/openai/v1/chat/completions",
+                    headers={"Authorization": "Bearer PROXY-SHARED-TOKEN"}, json={})
+    assert r.status_code == 200
+    # The token authenticated the client, then was replaced by the REAL key.
+    assert captured["headers"]["Authorization"] == f"Bearer {REAL_OPENAI}"
+    assert "PROXY-SHARED-TOKEN" not in captured["headers"]["Authorization"]
+
+
+def test_auth_correct_anthropic_token_via_x_api_key(authed_proxy):
+    client, captured = authed_proxy
+    r = client.post("/anthropic/v1/messages",
+                    headers={"x-api-key": "PROXY-SHARED-TOKEN"}, json={})
+    assert r.status_code == 200
+    assert captured["headers"]["x-api-key"] == REAL_ANTHROPIC
+
+
+def test_auth_401_before_provider_check(authed_proxy):
+    # An unauthenticated caller learns nothing — not even whether a provider exists.
+    client, captured = authed_proxy
+    r = client.post("/evil/v1/exfil", json={})
+    assert r.status_code == 401  # not 404 — auth is checked first
+    assert captured == {}
+
+
 def test_audit_log_never_contains_the_key_or_body(proxy, caplog):
     import logging
     client, _ = proxy
