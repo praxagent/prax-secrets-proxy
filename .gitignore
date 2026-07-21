@@ -1,0 +1,26 @@
+# ⚠️ SECRETS — this proxy's whole job is to hold the real API keys.
+# NEVER commit the env file that holds them. The committed template is
+# .env-example (no real keys); the real file is .env (ignored below).
+.env
+.env.*
+!.env-example
+*.env
+!.env-example
+secrets.*
+*.key
+*.pem
+
+# Audit logs may contain paths/metadata — keep them out of the repo.
+*.audit
+*.log
+
+# ---- Python ----
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+dist/
+build/
