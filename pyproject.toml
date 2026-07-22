@@ -14,6 +14,9 @@ dependencies = [
 [project.optional-dependencies]
 dev = ["pytest>=8.0", "ruff>=0.5"]
 prod = ["gunicorn>=21.0"]
+# The FORWARD (transparent MITM egress) proxy — proxies ALL of Prax's egress, not
+# just the model APIs. Heavy dep, so it's opt-in; only needed for forward mode.
+forward = ["mitmproxy>=11.0"]
 
 [project.scripts]
 prax-secrets-proxy = "secrets_proxy.__main__:main"

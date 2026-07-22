@@ -36,3 +36,36 @@ services:
       timeout: 5s
       retries: 3
       start_period: 10s
+
+  # ── FORWARD (transparent MITM egress) proxy — proxies ALL of Prax's egress ──
+  # Opt-in:  docker compose --profile forward up
+  # Runs mitmproxy with our addon; injects the right credential by destination
+  # host from PROXY_FORWARD_MAP (generated from Prax's credential registry:
+  # `python -m prax.services.credential_registry --export-forward-map`).
+  #
+  # ⚠️ This process TERMINATES TLS for ALL of Prax's egress — it sees every
+  # request body and holds every key. Run it LOCKED DOWN and isolated from Prax
+  # (its own container/user), exactly like the reverse proxy. Prax sets
+  # HTTPS_PROXY at it and trusts the mitmproxy CA. See the prax repo:
+  # docs/security/deployment-topology.md.
+  forward-proxy:
+    profiles: ["forward"]
+    image: mitmproxy/mitmproxy:latest
+    restart: unless-stopped
+    env_file: .env               # the real keys — same gitignored file
+    command: >
+      mitmdump --mode regular --listen-host 0.0.0.0 --listen-port 8786
+      --set stream_large_bodies=1m
+      -s /addon/secrets_proxy/mitm_addon.py
+    environment:
+      - PYTHONPATH=/addon
+      - PROXY_FORWARD_MAP=/config/forward-map.json
+    volumes:
+      - ./secrets_proxy:/addon/secrets_proxy:ro   # the addon + injector
+      - ./forward-map.json:/config/forward-map.json:ro
+      - mitm-ca:/home/mitmproxy/.mitmproxy        # persist the generated MITM CA
+    ports:
+      - "127.0.0.1:8786:8786"
+
+volumes:
+  mitm-ca:
