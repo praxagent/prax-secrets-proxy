@@ -4,7 +4,9 @@
 FROM python:3.13-slim
 
 # Non-root: the keys live in this process's env; don't also hand it root.
-RUN useradd --create-home --uid 10001 proxy
+# (The Debian base already has a system user named 'proxy' at uid 13, so we use a
+# distinct name/uid for the app account.)
+RUN useradd --create-home --uid 10001 proxyapp
 WORKDIR /app
 
 # Install deps first for layer caching.
@@ -15,7 +17,7 @@ RUN pip install --no-cache-dir '.[prod]'
 COPY docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
 RUN chmod +x /usr/local/bin/docker-entrypoint.sh
 
-USER proxy
+USER proxyapp
 
 ENV PROXY_HOST=0.0.0.0 PROXY_PORT=8785
 EXPOSE 8785
