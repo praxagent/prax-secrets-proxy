@@ -27,3 +27,8 @@ venv/
 .ruff_cache/
 dist/
 build/
+
+# Generated per-deployment from Prax's credential registry (no secrets, but
+# regenerable + can drift) — not committed:
+#   python -m prax.services.credential_registry --export-forward-map forward-map.json
+forward-map.json
