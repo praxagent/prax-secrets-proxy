@@ -91,18 +91,25 @@ class ForwardInjector:
             return bool(os.environ.get(rule.user_env or "") or os.environ.get(rule.pass_env or ""))
         return bool(os.environ.get(rule.key_env or ""))
 
+    def rules_for(self, host: str) -> list[ForwardRule]:
+        """ALL rules matching *host*, longest-host first (a host may need several
+        injections — e.g. Google CSE needs both ?key= and ?cx=)."""
+        return [r for r in self._rules if r.matches(host)]
+
     def inject(self, host: str, headers: dict[str, str], query: str = "") -> tuple[dict[str, str], str]:
-        """Return (headers, query_string) with the real credential injected.
+        """Return (headers, query_string) with the real credential(s) injected.
 
-        Any client-supplied value in the same slot is stripped first — the proxy
-        owns auth, never the (keyless) client. If no rule matches or the secret is
-        absent, the request passes through unchanged.
+        Applies EVERY matching rule for the host. Any client-supplied value in the
+        same slot is stripped first — the proxy owns auth, never the (keyless)
+        client. If no rule matches or a secret is absent, the request passes
+        through unchanged.
         """
-        rule = self.rule_for(host)
-        if rule is None:
-            return headers, query
-
         out = dict(headers)
+        for rule in self.rules_for(host):
+            query = self._apply(rule, out, query)
+        return out, query
+
+    def _apply(self, rule: ForwardRule, out: dict[str, str], query: str) -> str:
         scheme = rule.scheme
 
         if scheme == "bearer":
@@ -136,7 +143,7 @@ class ForwardInjector:
 
         for k, v in rule.extra_headers.items():
             out[k] = v
-        return out, query
+        return query
 
 
 def _strip(headers: dict[str, str], lower_name: str) -> None:

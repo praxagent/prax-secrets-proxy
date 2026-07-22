@@ -80,18 +80,20 @@ def test_missing_secret_leaves_request_unchanged(monkeypatch):
     assert "Authorization" not in h              # no key → nothing injected
 
 
-def test_longest_host_rule_wins():
+def test_multiple_rules_same_host_all_apply(monkeypatch):
+    """A host can need several injections (Google CSE = ?key= AND ?cx=). All apply."""
+    monkeypatch.setenv("GOOGLE_API_KEY", "goog-REAL")
+    monkeypatch.setenv("GOOGLE_CSE_ID", "cx-REAL")
     inj = ForwardInjector.from_map([
-        {"host": "example.com", "scheme": "header:X-Broad", "key_env": "K"},
-        {"host": "api.example.com", "scheme": "header:X-Specific", "key_env": "K"},
+        {"host": "www.googleapis.com", "scheme": "query:key", "key_env": "GOOGLE_API_KEY"},
+        {"host": "www.googleapis.com", "scheme": "query:cx", "key_env": "GOOGLE_CSE_ID"},
     ])
-    import os
-    os.environ["K"] = "v"
-    try:
-        h, _ = inj.inject("api.example.com", {})
-        assert "X-Specific" in h and "X-Broad" not in h
-    finally:
-        del os.environ["K"]
+    from urllib.parse import parse_qs
+    _, q = inj.inject("www.googleapis.com", {}, query="q=cats")
+    parsed = parse_qs(q)
+    assert parsed["key"] == ["goog-REAL"]
+    assert parsed["cx"] == ["cx-REAL"]
+    assert parsed["q"] == ["cats"]
 
 
 def test_secret_available_reports_correctly(env):
