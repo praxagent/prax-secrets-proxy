@@ -60,6 +60,13 @@ services:
     environment:
       - PYTHONPATH=/addon
       - PROXY_FORWARD_MAP=/config/forward-map.json
+      # Caller authentication. Unset = anyone who can reach the listener spends
+      # the real keys anonymously (the addon warns loudly at startup). The port
+      # below is published to loopback only, which is defence in depth, NOT the
+      # control — publishing is a deployment choice and this must hold on its
+      # own. Clients pass it as http://prax:<token>@host:8786; the username is
+      # free-form and lands in the audit line so injections are attributable.
+      - PROXY_FORWARD_AUTH_TOKEN=${PROXY_FORWARD_AUTH_TOKEN:-}
     volumes:
       - ./secrets_proxy:/addon/secrets_proxy:ro   # the addon + injector
       - ./forward-map.json:/config/forward-map.json:ro
