@@ -336,3 +336,59 @@ def test_truncated_upstream_stream_is_surfaced_not_silently_completed(monkeypatc
     # Either the error propagated, or only the partial chunk was delivered — but
     # NEVER a clean body with a fabricated completion the upstream never sent.
     assert raised or (b"partial" in body and b"[DONE]" not in body)
+
+
+# --------------------------------------------------------------------------- #
+# Body transparency — the proxy must not disturb provider-specific fields
+# --------------------------------------------------------------------------- #
+#
+# Prax marks its system prompt with Anthropic's `cache_control` breakpoint so a
+# tool-calling turn stops re-paying for the same prefix on every round. That
+# marker lives INSIDE the request body, and it travels through this proxy. If
+# the proxy ever re-serialised the body (or filtered unknown headers), caching
+# would silently stop working and would look like a provider regression rather
+# than a proxy change.
+#
+# The proxy forwards raw bytes today. These tests pin that as a contract rather
+# than an implementation detail, per the equivalence-testing standard: a
+# behaviour-preserving change must be tested for equivalence, not merely for
+# "nothing looked broken".
+
+def test_request_body_is_forwarded_byte_for_byte(proxy):
+    client, captured = proxy
+    payload = (b'{"model":"claude-x","system":[{"type":"text","text":"You are Prax.",'
+               b'"cache_control":{"type":"ephemeral"}}]}')
+    client.post("/anthropic/v1/messages", data=payload,
+                content_type="application/json")
+    assert captured["data"] == payload, (
+        "the proxy must not re-serialise the body — provider-specific fields "
+        "like cache_control would be reordered or dropped"
+    )
+
+
+def test_cache_control_survives_the_proxy(proxy):
+    """The behaviour that matters, asserted on the parsed body so the test
+    states the intent rather than a byte string."""
+    import json
+
+    client, captured = proxy
+    client.post("/anthropic/v1/messages", json={
+        "model": "claude-x",
+        "system": [{"type": "text", "text": "You are Prax.",
+                    "cache_control": {"type": "ephemeral"}}],
+    })
+    sent = json.loads(captured["data"])
+    assert sent["system"][0]["cache_control"] == {"type": "ephemeral"}
+
+
+def test_provider_specific_headers_are_forwarded(proxy):
+    """Header filtering is a hop-by-hop DENYLIST, not an allowlist. A provider
+    beta/feature header must reach the upstream untouched — an allowlist here
+    would silently disable features as providers add them."""
+    client, captured = proxy
+    client.post("/anthropic/v1/messages",
+                headers={"anthropic-beta": "some-feature-2026-01-01",
+                         "anthropic-version": "2023-06-01"}, json={})
+    fwd = {k.lower(): v for k, v in captured["headers"].items()}
+    assert fwd.get("anthropic-beta") == "some-feature-2026-01-01"
+    assert fwd.get("anthropic-version") == "2023-06-01"
