@@ -57,13 +57,20 @@ ANTHROPIC_KEY=<the PROXY_AUTH_TOKEN>
 
 ## Access token (the proxy owns it) + TLS
 
+This section is the **reverse proxy on `:8785`**. The opt-in forward proxy on `:8786`
+has its own, separate token (`PROXY_FORWARD_AUTH_TOKEN`) — see
+[Forward (MITM) proxy](#forward-mitm-proxy--opt-in-covers-all-egress).
+
 **The proxy owns the token.** So that only the *authorised* agent — not any other
 process or person who can reach the port — can spend the keys, the proxy requires a
 shared token. Generate it **on the proxy side** and set `PROXY_AUTH_TOKEN` in the
 proxy's `.env`; hand the agent a copy as its `OPENAI_KEY`/`ANTHROPIC_KEY`. The agent
 presents it in the normal auth slot (`Authorization: Bearer …` / `x-api-key`); the
 proxy validates it constant-time, then **strips it and injects the real provider
-key**. No token → `401`, before it even reveals whether a provider exists.
+key**. With `PROXY_AUTH_TOKEN` set, a missing or wrong token → `401`, before it even
+reveals whether a provider exists. Leaving `PROXY_AUTH_TOKEN` **empty runs the reverse
+proxy open** to any caller that can reach the port (`docker-compose.yml` publishes it
+to `127.0.0.1` only by default, and that reachability is then the only control).
 
 ```bash
 ./scripts/gen-token.sh          # prints prx_… → put in PROXY_AUTH_TOKEN + agent's keys
@@ -83,6 +90,9 @@ trusts the self-signed cert with **no code change**. (mTLS is a natural next ste
 you want the proxy to authenticate the agent by client cert instead of a token.)
 
 ## What it does — and its honest limits
+
+(This section describes the reverse proxy on `:8785`. The forward proxy's properties
+and verification status are in its own section below.)
 
 **Guarantees**
 - The agent never holds a real key → it can't be *exfiltrated* from the agent by any
@@ -108,6 +118,98 @@ you want the proxy to authenticate the agent by client cert instead of a token.)
 - **The proxy is the trusted component** — it holds the keys, so isolate it (its own
   user/container) and don't let the agent reach *its* config.
 
+## Forward (MITM) proxy — opt-in, covers all egress
+
+The reverse proxy above only covers providers that expose a base-URL knob (`/openai`,
+`/anthropic`). Everything else an agent calls (search APIs, TTS, telephony, …) goes
+straight to the real host over TLS, so the only way to keep *those* keys out of the
+agent is a **forward proxy that terminates TLS and injects the credential by
+destination host**. That is the `forward` compose profile: mitmproxy running this
+repo's addon (`secrets_proxy/mitm_addon.py`; the injection logic is
+`secrets_proxy/forward_inject.py`).
+
+```bash
+# 1. Generate the host→credential map from Prax's credential registry (run in the prax repo):
+python -m prax.services.credential_registry --export-forward-map ../prax-secrets-proxy/forward-map.json
+# 2. Set PROXY_FORWARD_AUTH_TOKEN in the proxy's .env (see below), then:
+docker compose --profile forward up      # mitmdump on :8786, published to 127.0.0.1 only
+```
+
+Natively, the addon needs the `forward` extra (`pip install -e '.[forward]'`, which
+pulls in mitmproxy) and runs as
+`mitmdump --mode regular --listen-host 127.0.0.1 --listen-port 8786 -s secrets_proxy/mitm_addon.py`
+with `PROXY_FORWARD_MAP` pointing at the map file. Pass `--listen-host` explicitly:
+mitmdump's `listen_host` default is empty, which binds every interface, so without it
+the native listener is not loopback-only the way the compose port mapping is.
+
+**The forward-map.** `forward-map.json` is generated, gitignored, and mounted
+read-only into the container. Each rule is a destination host plus one of four
+injection schemes (`bearer`, `header:<Name>`, `basic`, `query:<param>`) and the env
+var(s) holding the real value; a rule matches its host exactly or as a dot-suffix
+(`tavily.com` also covers `api.tavily.com`), longest host first. A host with no rule
+passes through untouched, and with no map at all the proxy injects nothing. The map
+includes the model providers, so in forward mode you do **not** also set
+`OPENAI_BASE_URL`/`ANTHROPIC_BASE_URL`.
+
+**Client wiring.** The client sets `HTTPS_PROXY` (and `HTTP_PROXY`) at the proxy with
+the token in the URL's credential slot, and trusts the mitmproxy CA:
+
+```bash
+HTTPS_PROXY=http://prax:<PROXY_FORWARD_AUTH_TOKEN>@<proxy-host>:8786
+# CA: mitmproxy generates one on first start; the compose file persists it in the
+# `mitm-ca` volume at /home/mitmproxy/.mitmproxy/mitmproxy-ca-cert.pem. Copy it out
+# and add it to the bundle the client trusts (SSL_CERT_FILE / REQUESTS_CA_BUNDLE).
+```
+
+The Prax-side procedure (CA bundle, `NO_PROXY`, non-empty placeholder keys) is in the
+prax repo:
+[`docs/security/deployment-topology.md`](https://github.com/praxagent/prax/blob/main/docs/security/deployment-topology.md).
+
+**Caller authentication — `PROXY_FORWARD_AUTH_TOKEN`.** This listener has its own
+token, separate from the reverse proxy's `PROXY_AUTH_TOKEN`:
+
+- With the token set, the addon reads `Proxy-Authorization` — `Basic user:token`
+  (what HTTP clients send for credentials in a proxy URL) or `Bearer token` —
+  compares the token constant-time, and answers `407` with
+  `Proxy-Authenticate: Basic realm="prax-forward-proxy"` on a missing or wrong token.
+  The check runs **before** the injection rule is looked up, so a refused caller
+  cannot probe which hosts get credentials.
+- The credential is stripped before the request goes upstream, token or no token — it
+  authenticates the caller to this proxy and must never reach a provider.
+- With the token **empty** the forward proxy is **open**: anyone who can reach
+  `:8786` spends the real keys anonymously. The addon logs a warning at startup;
+  loopback publishing is then the only control.
+- The `Basic` username is free-form and is meant to identify the caller in the
+  audit line (see the known gap below).
+
+**Audit.** The addon logs one line per injected request —
+`[forward] injected <scheme> @ <host> (caller=<label>)` — and never a key or a body.
+(mitmdump's own console output is separate from this line.)
+
+**Known gap (2026-09):** the `caller=` label is always `-`. `request()` in
+`secrets_proxy/mitm_addon.py` deletes `Proxy-Authorization` (to keep it off the wire
+upstream) before it calls `_caller_label()` on the same headers, so the username is
+gone by the time the audit line is built. Reproduced with a valid `Basic` credential.
+The unit test for the label (`tests/test_forward_auth.py`,
+`test_caller_label_is_the_username_never_the_token`) calls `_caller_label()` on a
+hand-built header dict rather than through `request()`, so it does not catch this.
+
+**Verification status.** The 407/allow/strip behaviour above is **unit-tested only**,
+against a hand-built request object (`tests/test_forward_auth.py`), not through
+mitmproxy. One open question matters for real clients: the check runs in mitmproxy's
+`request` hook, and HTTP clients send `Proxy-Authorization` on the `CONNECT` request
+when the destination is `https://`, not on the tunnelled requests inside it. Whether
+the hook sees that credential for HTTPS destinations has **not been verified live**
+with the token set; if it does not, HTTPS callers get `407` on every request once
+`PROXY_FORWARD_AUTH_TOKEN` is set. Until that is verified, treat the forward proxy's
+token gate as unproven and keep `:8786` on loopback or a private interface.
+
+**What this process can see.** It terminates TLS for **all** proxied egress: every
+destination, every request and response body, and it holds every key in the map. It
+is strictly more trusted than the reverse proxy. Run it locked down and isolated from
+the agent (its own container/user), exactly like the reverse proxy. The "stops theft,
+not abuse" limit above applies unchanged.
+
 ## Production
 
 - Front it with a real WSGI server, not the Flask dev server (the Docker image does
@@ -115,6 +217,8 @@ you want the proxy to authenticate the agent by client cert instead of a token.)
 - **Set `PROXY_AUTH_TOKEN`** and require it from the agent; **enable TLS** for any
   non-loopback link (or run over a tunnel — WireGuard/Tailscale). Loopback on a
   trusted host can skip both (nothing crosses a wire).
+- Forward mode: set **`PROXY_FORWARD_AUTH_TOKEN`** as well, and read the verification
+  status above before relying on it as the control.
 - Run it as its own container/user with the keys in *its* secret store only.
 
 ## Test
