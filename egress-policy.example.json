@@ -1,0 +1,19 @@
+{
+  "_comment": "Egress policy for Prax's OWN traffic through the forward proxy (secrets_proxy/egress_policy.py). Model/service providers Prax needs are allowed. Reading the web (GET/HEAD) is allowed while nothing private has been read in the current work (clean_only) and asked about otherwise. Anything that sends data (POST/PUT/PATCH/DELETE) to a host not listed is asked about. Tune to your integrations.",
+  "default": "ask",
+  "rules": [
+    {"host": "api.openai.com", "action": "allow"},
+    {"host": "api.anthropic.com", "action": "allow"},
+    {"host": "openrouter.ai", "action": "allow"},
+    {"host": "discord.com", "action": "allow"},
+    {"host": "gateway.discord.gg", "action": "allow"},
+    {"host": "*.discord.gg", "action": "allow"},
+    {"host": "cdn.discordapp.com", "action": "allow"},
+    {"host": "api.twilio.com", "action": "allow"},
+    {"host": "api.search.brave.com", "action": "allow"},
+    {"host": "api.tavily.com", "action": "allow"},
+    {"host": "r.jina.ai", "action": "allow"},
+    {"host": "*", "methods": ["GET", "HEAD"], "action": "allow", "clean_only": true}
+  ],
+  "allow_private_addresses": []
+}

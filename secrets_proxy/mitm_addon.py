@@ -32,6 +32,13 @@ from secrets_proxy.forward_inject import ForwardInjector
 logger = logging.getLogger("secrets_proxy.forward")
 _injector = ForwardInjector.from_env()
 
+# Egress policy — off unless PROXY_EGRESS_POLICY is set (secrets_proxy/egress_policy.py).
+from secrets_proxy import egress_policy as _egress_mod  # noqa: E402
+
+_egress = _egress_mod.from_env()
+_ADMIN_PORT = int(os.environ.get("PROXY_EGRESS_ADMIN_PORT", "8791"))
+
+
 # Caller authentication. The Tier-1 reverse proxy has always required a token;
 # this one did not, so ANY process able to reach the listener could spend the
 # real keys — it cannot steal them (that is the point of keyless), but it can
@@ -86,8 +93,12 @@ def _caller_label(headers) -> str:  # noqa: ANN001
     return user[:40] or "-"
 
 
-def request(flow) -> None:  # noqa: ANN001 - mitmproxy passes an http.HTTPFlow
-    """mitmproxy hook: authenticate the caller, then inject by destination host."""
+async def request(flow) -> None:  # noqa: ANN001 - mitmproxy passes an http.HTTPFlow
+    """mitmproxy hook: authenticate the caller, decide the request (policy on),
+    then inject by destination host.
+
+    Async so a request held for a person's answer does not stall the others.
+    """
     req = flow.request
     host = req.pretty_host
 
@@ -103,6 +114,16 @@ def request(flow) -> None:  # noqa: ANN001 - mitmproxy passes an http.HTTPFlow
     # and must never travel on to the provider.
     if "Proxy-Authorization" in req.headers:
         del req.headers["Proxy-Authorization"]
+
+    # Decide BEFORE anything is injected or sent. The whole request is visible
+    # here — TLS is already terminated — so HTTPS is judged on method and path.
+    if _egress is not None:
+        verdict, why = await _egress.check(host, req.port, req.method, req.path)
+        logger.info("[egress] %s %s %s:%s%s — %s", verdict, req.method, host, req.port,
+                    req.path.split("?", 1)[0][:80], why)
+        if verdict != "allow":
+            flow.response = _forbidden(why)
+            return
 
     rule = _injector.rule_for(host)
     if rule is None:
@@ -140,10 +161,32 @@ def _unauthorized():  # noqa: ANN202 - mitmproxy Response
     )
 
 
-def running() -> None:
-    """mitmproxy lifecycle hook — warn loudly if this is running open."""
+async def running() -> None:
+    """mitmproxy lifecycle hook: warn if running open; start the egress policy."""
     if not _AUTH_TOKEN:
         logger.warning(
             "[forward] PROXY_FORWARD_AUTH_TOKEN is not set — ANY caller that can "
             "reach this listener can spend the real credentials anonymously. "
             "Set it, and publish the port to loopback or a private interface only.")
+    if _egress is None:
+        return
+    import asyncio
+
+    from mitmproxy import ctx
+
+    # Connect upstream only once a request is allowed. mitmproxy's default
+    # ("eager") dials — and so resolves — the destination as soon as a CONNECT
+    # arrives, i.e. before the policy has decided: a denied name would still
+    # leave as a DNS query.
+    ctx.options.update(connection_strategy="lazy")
+    await asyncio.start_server(
+        lambda r, w: _egress_mod.handle_admin(_egress, r, w), "0.0.0.0", _ADMIN_PORT)
+    logger.info("[forward] egress policy on: default=%s, %d rules, admin :%d",
+                _egress.policy.default, len(_egress.policy.rules), _ADMIN_PORT)
+
+
+def _forbidden(why: str):  # noqa: ANN202 - mitmproxy Response
+    from mitmproxy import http
+
+    return http.Response.make(
+        403, f"Blocked by the egress policy: {why}\n".encode(), {"Content-Type": "text/plain"})

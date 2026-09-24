@@ -210,6 +210,43 @@ is strictly more trusted than the reverse proxy. Run it locked down and isolated
 the agent (its own container/user), exactly like the reverse proxy. The "stops theft,
 not abuse" limit above applies unchanged.
 
+## Egress policy — opt-in: decide every request Prax makes
+
+By default the forward proxy injects keys for known hosts and **passes
+everything else through untouched**. Set `PROXY_EGRESS_POLICY` (and
+`PROXY_EGRESS_ADMIN_TOKEN`) and it decides every request instead: `allow`,
+`deny`, or `ask`. An `ask` holds the request while the harness asks a person
+through the admin API (`127.0.0.1:${PROXY_EGRESS_ADMIN_PORT:-8791}`). The
+policy lives in `secrets_proxy/egress_policy.py`, with an example in
+`egress-policy.example.json`.
+
+**Why here.** This proxy already terminates TLS for all of Prax's traffic, so
+rules see the **method and path of HTTPS requests**, not only the host. You
+can allow `GET` but ask about `POST` to the same site.
+
+**No DNS before a decision.** With the policy on, the add-on switches mitmproxy
+to `connection_strategy=lazy`. A denied or merely-asked-about name is never
+resolved, so it cannot leave as a DNS query. After an allow, a name that
+resolves to a private, loopback or link-local address is still refused
+(SSRF).
+
+**Answers are scoped.** They are remembered per host + method + path for
+`PROXY_EGRESS_ALLOW_TTL`. An allow given while clean is not reused once the
+harness marks the work tainted. No answer means deny.
+
+**Enforcement is the other half.** A policy only binds traffic that goes
+through the proxy. Prax's `deploy/systemd/prax.service.d/40-egress-only-through-the-proxy.conf`
+restricts the Prax process to loopback, with the kernel enforcing it, so the
+proxy is its only way out.
+
+Verified live (2026-09-24), with the real mitmproxy and Prax's approval
+poller:
+- `GET https://example.net` was allowed by rule;
+- `POST https://example.net/upload` was held, then denied by a person (403);
+- an unknown host was held, then allowed (200);
+- a process under the loopback-only restriction could not connect directly,
+  but could through the proxy.
+
 ## Production
 
 - Front it with a real WSGI server, not the Flask dev server (the Docker image does

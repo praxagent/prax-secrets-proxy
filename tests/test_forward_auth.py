@@ -13,6 +13,7 @@ anyway — a proxy that is safe only because of how someone happened to publish
 its port is not safe, and the topology is a deployment choice.
 """
 
+import asyncio
 import base64
 import importlib
 import sys
@@ -117,20 +118,20 @@ class TestEnforcement:
     def test_missing_credentials_are_refused(self, addon):
         m = addon("secret")
         f = _Flow("api.openai.com")
-        m.request(f)
+        asyncio.run(m.request(f))
         assert f.response is not None
         assert f.response.status_code == 407
 
     def test_wrong_token_is_refused(self, addon):
         m = addon("secret")
         f = _Flow("api.openai.com", basic("prax", "wrong"))
-        m.request(f)
+        asyncio.run(m.request(f))
         assert f.response is not None and f.response.status_code == 407
 
     def test_correct_token_is_allowed_through(self, addon):
         m = addon("secret")
         f = _Flow("api.openai.com", basic("prax", "secret"))
-        m.request(f)
+        asyncio.run(m.request(f))
         assert f.response is None, "an authenticated caller must not be blocked"
 
     def test_refusal_does_not_reveal_whether_the_host_is_a_target(self, addon):
@@ -138,14 +139,14 @@ class TestEnforcement:
         unauthenticated caller cannot probe which hosts get credentials."""
         m = addon("secret")
         known, unknown = _Flow("api.openai.com"), _Flow("example.invalid")
-        m.request(known)
-        m.request(unknown)
+        asyncio.run(m.request(known))
+        asyncio.run(m.request(unknown))
         assert known.response.status_code == unknown.response.status_code == 407
 
     def test_407_advertises_the_scheme(self, addon):
         m = addon("secret")
         f = _Flow("api.openai.com")
-        m.request(f)
+        asyncio.run(m.request(f))
         assert "Proxy-Authenticate" in f.response.headers
 
 
@@ -155,13 +156,13 @@ class TestCredentialHygiene:
         would leak our own shared secret to every destination."""
         m = addon("secret")
         f = _Flow("api.openai.com", basic("prax", "secret"))
-        m.request(f)
+        asyncio.run(m.request(f))
         assert "Proxy-Authorization" not in f.request.headers
 
     def test_stripped_even_when_auth_is_disabled(self, addon):
         m = addon(None)
         f = _Flow("api.openai.com", basic("prax", "anything"))
-        m.request(f)
+        asyncio.run(m.request(f))
         assert "Proxy-Authorization" not in f.request.headers
 
     def test_caller_label_is_the_username_never_the_token(self, addon):
@@ -176,17 +177,17 @@ class TestUnconfiguredStaysOpenButLoud:
         """Back-compat: an existing deployment must not break on upgrade."""
         m = addon(None)
         f = _Flow("api.openai.com")
-        m.request(f)
+        asyncio.run(m.request(f))
         assert f.response is None
 
     def test_running_hook_warns_when_open(self, addon, caplog):
         m = addon(None)
         with caplog.at_level("WARNING"):
-            m.running()
+            asyncio.run(m.running())
         assert "PROXY_FORWARD_AUTH_TOKEN is not set" in caplog.text
 
     def test_running_hook_silent_when_configured(self, addon, caplog):
         m = addon("secret")
         with caplog.at_level("WARNING"):
-            m.running()
+            asyncio.run(m.running())
         assert "not set" not in caplog.text

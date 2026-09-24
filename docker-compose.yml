@@ -67,12 +67,21 @@ services:
       # own. Clients pass it as http://prax:<token>@host:8786; the username is
       # free-form and lands in the audit line so injections are attributable.
       - PROXY_FORWARD_AUTH_TOKEN=${PROXY_FORWARD_AUTH_TOKEN:-}
+      # Egress policy (opt-in): set PROXY_EGRESS_POLICY=/config/egress-policy.json
+      # and a PROXY_EGRESS_ADMIN_TOKEN, and every request Prax makes is allowed,
+      # denied or held for a person (secrets_proxy/egress_policy.py). Unset = pass
+      # unknown destinations through, as before.
+      - PROXY_EGRESS_POLICY=${PROXY_EGRESS_POLICY:-}
+      - PROXY_EGRESS_ADMIN_TOKEN=${PROXY_EGRESS_ADMIN_TOKEN:-}
+      - PROXY_EGRESS_ASK_TIMEOUT=${PROXY_EGRESS_ASK_TIMEOUT:-120}
     volumes:
       - ./secrets_proxy:/addon/secrets_proxy:ro   # the addon + injector
       - ./forward-map.json:/config/forward-map.json:ro
+      - ${PROXY_EGRESS_POLICY_FILE:-./egress-policy.example.json}:/config/egress-policy.json:ro
       - mitm-ca:/home/mitmproxy/.mitmproxy        # persist the generated MITM CA
     ports:
       - "127.0.0.1:8786:8786"
+      - "127.0.0.1:${PROXY_EGRESS_ADMIN_PORT:-8791}:8791"   # egress admin API (policy on only)
 
 volumes:
   mitm-ca:
