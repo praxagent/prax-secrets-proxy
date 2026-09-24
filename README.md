@@ -215,14 +215,26 @@ not abuse" limit above applies unchanged.
 By default the forward proxy injects keys for known hosts and **passes
 everything else through untouched**. Set `PROXY_EGRESS_POLICY` (and
 `PROXY_EGRESS_ADMIN_TOKEN`) and it decides every request instead: `allow`,
-`deny`, or `ask`. An `ask` holds the request while the harness asks a person
-through the admin API (`127.0.0.1:${PROXY_EGRESS_ADMIN_PORT:-8791}`). The
+`deny`, or `ask`. An `ask` holds the request while a person is asked through
+the admin API (`127.0.0.1:${PROXY_EGRESS_ADMIN_PORT:-8791}`).
+
+**Tokens:**
+- `PROXY_EGRESS_ADMIN_TOKEN` answers questions and belongs to the relay that
+  carries a person's answers (TeamWork `EGRESS_GATES`), **never the agent**.
+- `PROXY_EGRESS_TAINT_TOKEN` is the agent's, and can only raise taint. The
 policy lives in `secrets_proxy/egress_policy.py`, with an example in
 `egress-policy.example.json`.
 
 **Why here.** This proxy already terminates TLS for all of Prax's traffic, so
 rules see the **method and path of HTTPS requests**, not only the host. You
 can allow `GET` but ask about `POST` to the same site.
+
+**Judged on what is dialled.** A request is judged on the address the proxy
+will actually connect to (the CONNECT target or absolute URL), and refused if
+its `Host` header disagrees. The connection is **pinned** to the address that
+was checked, so DNS rebinding cannot redirect it inside. Paths are decoded
+and normalised before matching (`/public/../admin` is not under `/public`).
+Raw TCP tunnels, which never reach the request hook, are refused.
 
 **No DNS before a decision.** With the policy on, the add-on switches mitmproxy
 to `connection_strategy=lazy`. A denied or merely-asked-about name is never

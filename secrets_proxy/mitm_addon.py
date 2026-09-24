@@ -118,6 +118,16 @@ async def request(flow) -> None:  # noqa: ANN001 - mitmproxy passes an http.HTTP
     # Decide BEFORE anything is injected or sent. The whole request is visible
     # here — TLS is already terminated — so HTTPS is judged on method and path.
     if _egress is not None:
+        # Judge the address that will actually be DIALLED (req.host: the CONNECT
+        # target or absolute-form URL), not the client-chosen Host header — and
+        # refuse a request whose Host header disagrees with it.
+        target = (req.host or "").lower().rstrip(".")
+        claimed = (host or "").lower().rstrip(".")
+        if claimed and claimed != target:
+            logger.info("[egress] deny: Host %r does not match the dialled %r", claimed, target)
+            flow.response = _forbidden(f"Host header {claimed} does not match the destination {target}")
+            return
+        host = target
         verdict, why = await _egress.check(host, req.port, req.method, req.path)
         logger.info("[egress] %s %s %s:%s%s — %s", verdict, req.method, host, req.port,
                     req.path.split("?", 1)[0][:80], why)
@@ -179,10 +189,53 @@ async def running() -> None:
     # arrives, i.e. before the policy has decided: a denied name would still
     # leave as a DNS query.
     ctx.options.update(connection_strategy="lazy")
+    # A CONNECT tunnel carrying neither TLS nor HTTP would otherwise become a
+    # raw TCP relay that never reaches the request hook — i.e. never decided.
+    ctx.options.update(rawtcp=False)
     await asyncio.start_server(
         lambda r, w: _egress_mod.handle_admin(_egress, r, w), "0.0.0.0", _ADMIN_PORT)
     logger.info("[forward] egress policy on: default=%s, %d rules, admin :%d",
                 _egress.policy.default, len(_egress.policy.rules), _ADMIN_PORT)
+
+
+async def server_connect(data) -> None:  # noqa: ANN001 - mitmproxy ServerConnectionHookData
+    """Connect to the address that was checked, never a second resolution.
+
+    Every upstream connection passes here (after the request was allowed, with
+    connection_strategy=lazy). The name is resolved once, checked against
+    private / loopback / link-local ranges, and the connection is pinned to
+    that address — a DNS answer that changes between check and connect
+    (rebinding) cannot redirect it inside. SNI keeps the original name.
+    """
+    if _egress is None:
+        return
+    server = data.server
+    host, port = server.address
+    try:
+        ip = await _egress.pinned_address(str(host), int(port))
+    except (PermissionError, OSError) as exc:
+        logger.info("[egress] deny connect %s:%s — %s", host, port, exc)
+        server.error = f"egress policy: {exc}"
+        return
+    if server.sni is None and not _is_ip_literal(str(host)):
+        server.sni = str(host)
+    server.address = (ip, port)
+
+
+def tcp_start(flow) -> None:  # noqa: ANN001 - mitmproxy TCPFlow
+    """Raw TCP is never decided by the request hook: refuse it outright."""
+    if _egress is not None:
+        logger.info("[egress] deny raw TCP to %s", getattr(flow.server_conn, "address", "?"))
+        flow.kill()
+
+
+def _is_ip_literal(host: str) -> bool:
+    import ipaddress
+    try:
+        ipaddress.ip_address(host.strip("[]"))
+        return True
+    except ValueError:
+        return False
 
 
 def _forbidden(why: str):  # noqa: ANN202 - mitmproxy Response

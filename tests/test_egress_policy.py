@@ -131,8 +131,10 @@ def addon_with_policy(monkeypatch, tmp_path):
 
 
 class _Req:
-    def __init__(self, host, method="GET", path="/", port=443):
+    def __init__(self, host, method="GET", path="/", port=443, dialled=None):
+        # pretty_host comes from the client's Host header; host is what mitmproxy dials.
         self.pretty_host, self.method, self.path, self.port = host, method, path, port
+        self.host = dialled or host
         self.headers = {}
 
         class Q:
@@ -173,3 +175,107 @@ def test_the_example_policy_parses_and_reads_the_web_only_while_clean():
     assert p.decide("blog.example", 443, "GET", "/post", False)[0] == "allow"
     assert p.decide("blog.example", 443, "GET", "/post?q=secret", True)[0] == "ask"
     assert p.decide("paste.example", 443, "POST", "/new", False)[0] == "ask"
+
+
+
+# --- review follow-ups -------------------------------------------------------------
+
+def test_a_spoofed_host_header_does_not_choose_the_decision(addon_with_policy):
+    # Host says the allowed api.openai.com; the tunnel actually goes elsewhere.
+    f = _Flow("api.openai.com", dialled="evil.example")
+    asyncio.run(addon_with_policy.request(f))
+    assert f.response is not None and f.response.status_code == 403
+
+
+def test_paths_are_normalised_before_matching():
+    p = Policy.from_dict({"default": "deny", "rules": [
+        {"host": "a.example", "paths": ["/public"], "action": "allow"}]})
+    assert p.decide("a.example", 443, "GET", "/public/x", False)[0] == "allow"
+    for sneaky in ("/public/../admin", "/public/%2e%2e/private", "/public/%252e%252e/x", "/publicity"):
+        assert p.decide("a.example", 443, "GET", sneaky, False)[0] == "deny", sneaky
+
+
+def test_private_allowlist_accepts_cidrs():
+    async def run():
+        e = EgressPolicy(Policy.from_dict({"default": "allow", "allow_private_addresses": ["10.0.0.0/8"]}), TOKEN)
+        assert await e.pinned_address("10.1.2.3", 443) == "10.1.2.3"
+        with pytest.raises(PermissionError):
+            await e.pinned_address("192.168.1.1", 443)
+    asyncio.run(run())
+
+
+def test_a_late_joiner_is_not_left_waiting_on_a_vanished_question():
+    async def run():
+        e = _egress({"default": "ask"}, ask_timeout=0.3)
+        first = asyncio.create_task(e.check("q.example", 443, "GET", "/"))
+        await asyncio.sleep(0.2)
+        second = asyncio.create_task(e.check("q.example", 443, "GET", "/"))
+        t0 = asyncio.get_running_loop().time()
+        assert (await first)[0] == "deny" and (await second)[0] == "deny"
+        assert asyncio.get_running_loop().time() - t0 < 0.3  # not a second full timeout
+    asyncio.run(run())
+
+
+def test_a_voided_answer_is_not_cached_so_the_retry_asks_again():
+    async def run():
+        e = _egress({"default": "ask"}, ask_timeout=5)
+        t = asyncio.create_task(e.check("n.example", 443, "GET", "/"))
+        await asyncio.sleep(0.05)
+        e.set_taint(True, "private")
+        e.answer(e.pending()[0]["id"], True)
+        assert (await t)[0] == "deny"
+        retry = asyncio.create_task(e.check("n.example", 443, "GET", "/"))
+        await asyncio.sleep(0.05)
+        assert e.pending(), "the retry should be a fresh question"
+        e.answer(e.pending()[0]["id"], False)
+        await retry
+    asyncio.run(run())
+
+
+def test_the_taint_token_only_raises():
+    async def run():
+        e = EgressPolicy(Policy.from_dict({"default": "ask"}), TOKEN, taint_token="t")
+        srv = await asyncio.start_server(lambda r, w: handle_admin(e, r, w), "127.0.0.1", 0)
+        port = srv.sockets[0].getsockname()[1]
+
+        async def call(method, path, body, token):
+            r, w = await asyncio.open_connection("127.0.0.1", port)
+            raw = json.dumps(body).encode()
+            w.write(f"{method} {path} HTTP/1.1\r\nAuthorization: Bearer {token}\r\n"
+                    f"Content-Length: {len(raw)}\r\n\r\n".encode() + raw)
+            await w.drain()
+            return int((await r.read()).split(b" ", 2)[1])
+        assert await call("POST", "/taint", {"tainted": True}, "t") == 200 and e.tainted
+        assert await call("POST", "/taint", {"tainted": False}, "t") == 403 and e.tainted
+        assert await call("POST", "/pending/1", {"allow": True}, "t") == 403
+        srv.close()
+    asyncio.run(run())
+
+
+def test_server_connect_pins_the_checked_address(addon_with_policy):
+    class Server:
+        address, sni, error = ("api.openai.com", 443), None, None
+    class Data:
+        server = Server()
+    asyncio.run(addon_with_policy.server_connect(Data))
+    assert Data.server.address == ("93.184.216.34", 443) and Data.server.sni == "api.openai.com"
+
+    async def rebinding(host, port):
+        return ["10.0.0.9"]
+    addon_with_policy._egress._resolver = rebinding
+    class Server2:
+        address, sni, error = ("api.openai.com", 443), None, None
+    class Data2:
+        server = Server2()
+    asyncio.run(addon_with_policy.server_connect(Data2))
+    assert Data2.server.error and "non-public" in Data2.server.error
+
+
+def test_raw_tcp_is_refused_when_the_policy_is_on(addon_with_policy):
+    killed = []
+    class F:
+        server_conn = type("S", (), {"address": ("x", 22)})()
+        def kill(self):
+            killed.append(1)
+    addon_with_policy.tcp_start(F())
+    assert killed == [1]

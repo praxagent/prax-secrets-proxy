@@ -67,16 +67,45 @@ class Rule:
             return False
         if self.methods and method.upper() not in self.methods:
             return False
-        if self.paths and not any(path.startswith(p) for p in self.paths):
+        if self.paths and not any(_path_under(path, p) for p in self.paths):
             return False
         return not (self.clean_only and tainted)
+
+
+def normalize_path(path: str) -> str:
+    """Decode and collapse a request path, so a rule sees what the server will.
+
+    ``/public/../admin`` and ``/public/%2e%2e/private`` are NOT under ``/public``.
+    """
+    import posixpath
+    from urllib.parse import unquote
+
+    raw = path.split("?", 1)[0] or "/"
+    for _ in range(3):  # double-encoding
+        decoded = unquote(raw)
+        if decoded == raw:
+            break
+        raw = decoded
+    norm = posixpath.normpath("/" + raw.lstrip("/"))
+    return "/" if norm in (".", "//") else norm
+
+
+def _path_under(path: str, prefix: str) -> bool:
+    """Segment-aware: ``/public`` covers ``/public`` and ``/public/x``, not ``/publicity``."""
+    p = normalize_path(path)
+    base = "/" + prefix.strip("/")
+    return base == "/" or p == base or p.startswith(base + "/")
 
 
 @dataclass
 class Policy:
     default: str = ASK
     rules: list[Rule] = field(default_factory=list)
-    allow_private_addresses: frozenset[str] = frozenset()
+    allow_private_addresses: tuple = ()   # ip_network objects (exact IPs or CIDRs)
+
+    def private_allowed(self, ip: str) -> bool:
+        addr = ipaddress.ip_address(ip)
+        return any(addr in net for net in self.allow_private_addresses)
 
     @classmethod
     def from_dict(cls, data: dict) -> Policy:
@@ -95,7 +124,8 @@ class Policy:
                 paths=tuple(str(p) for p in raw.get("paths", [])),
                 clean_only=bool(raw.get("clean_only", False)),
             ))
-        return cls(default, rules, frozenset(data.get("allow_private_addresses", [])))
+        nets = tuple(ipaddress.ip_network(str(a), strict=False) for a in data.get("allow_private_addresses", []))
+        return cls(default, rules, nets)
 
     def decide(self, host: str, port: int, method: str, path: str, tainted: bool) -> tuple[str, str]:
         for i, rule in enumerate(self.rules):
@@ -129,9 +159,13 @@ class EgressPolicy:
 
     def __init__(self, policy: Policy, admin_token: str, *, ask_timeout: float = 120.0,
                  allow_ttl: float = 600.0, deny_ttl: float = 60.0, taint_ttl: float = 300.0,
-                 resolver=None):
+                 resolver=None, taint_token: str = ""):
         self.policy = policy
+        # Admin: for the relay carrying a PERSON's answers (e.g. TeamWork).
+        # Taint: raise-only, for the agent whose traffic is judged — it must
+        # never hold the admin token, or it could approve its own requests.
         self.admin_token = admin_token
+        self.taint_token = taint_token
         self.ask_timeout, self.allow_ttl, self.deny_ttl, self.taint_ttl = ask_timeout, allow_ttl, deny_ttl, taint_ttl
         self._resolver = resolver or self._resolve
         self._decisions: dict[str, tuple[str, float, str, bool]] = {}
@@ -145,16 +179,18 @@ class EgressPolicy:
     def tainted(self) -> bool:
         return time.monotonic() < self._tainted_until
 
-    def set_taint(self, tainted: bool, reason: str = "", ttl: float | None = None) -> None:
+    def set_taint(self, tainted: bool, reason: str = "", ttl: float | None = None,
+                  raise_only: bool = False) -> None:
         if tainted:
-            self._tainted_until = time.monotonic() + (ttl or self.taint_ttl)
+            until = time.monotonic() + (ttl or self.taint_ttl)
+            self._tainted_until = max(self._tainted_until, until) if raise_only else until
             self.taint_reason = reason
         else:
             self._tainted_until, self.taint_reason = 0.0, ""
 
     @staticmethod
     def key(host: str, port: int, method: str, path: str) -> str:
-        return f"{host.lower()}:{port} {method.upper()} {path.split('?', 1)[0]}"
+        return f"{host.lower()}:{port} {method.upper()} {normalize_path(path)}"
 
     async def check(self, host: str, port: int, method: str, path: str) -> tuple[str, str]:
         """``(allow|deny, reason)`` for one request. May wait for a person."""
@@ -186,11 +222,17 @@ class EgressPolicy:
                                path.split("?", 1)[0], tainted,
                                asyncio.get_running_loop().create_future())
             self._pending[pending.id], self._by_key[key] = pending, pending.id
+        remaining = max(0.0, self.ask_timeout - (time.monotonic() - pending.created))
         try:
-            return await asyncio.wait_for(asyncio.shield(pending.future), self.ask_timeout)
+            return await asyncio.wait_for(asyncio.shield(pending.future), remaining)
         except TimeoutError:
+            # Resolve the shared question for EVERY waiter — a request that
+            # joined late must not be left waiting on a question no one can
+            # see or answer any more.
             self._forget(pending)
             self._decisions[key] = (DENY, time.monotonic() + self.deny_ttl, "no answer", tainted)
+            if not pending.future.done():
+                pending.future.set_result((DENY, "asked; no answer in time"))
             return DENY, "asked; no answer in time"
 
     def _forget(self, p: _Pending) -> None:
@@ -204,10 +246,15 @@ class EgressPolicy:
             return False
         action = ALLOW if allow else DENY
         why = f"{'allowed' if allow else 'denied'} by {by or 'the harness'}"
-        if allow and self.tainted and not p.tainted:
-            action, why = DENY, "tainted since this was asked; ask again"
-        hold = ttl if ttl is not None else (self.allow_ttl if action == ALLOW else self.deny_ttl)
-        self._decisions[p.key] = (action, time.monotonic() + hold, why, p.tainted)
+        voided = allow and self.tainted and not p.tainted
+        if voided:
+            # Answered a question asked while clean; it has read private data
+            # since. Refuse this request, but remember nothing, so the retry is
+            # a fresh question rather than a cached deny.
+            action, why = DENY, "tainted since this was asked; the next attempt asks again"
+        else:
+            hold = ttl if ttl is not None else (self.allow_ttl if action == ALLOW else self.deny_ttl)
+            self._decisions[p.key] = (action, time.monotonic() + hold, why, p.tainted)
         self._forget(p)
         if not p.future.done():
             p.future.set_result((action, why))
@@ -225,7 +272,7 @@ class EgressPolicy:
             ip = str(ipaddress.ip_address(host.strip("[]")))
         except ValueError:
             return ""
-        if not is_public(ip) and ip not in self.policy.allow_private_addresses:
+        if not is_public(ip) and not self.policy.private_allowed(ip):
             return f"{host} is a non-public address"
         return ""
 
@@ -241,8 +288,24 @@ class EgressPolicy:
             addrs = await self._resolver(host, port)
         except OSError as exc:
             return f"{host} did not resolve ({exc})"
-        bad = [a for a in addrs if not is_public(a) and a not in self.policy.allow_private_addresses]
+        bad = [a for a in addrs if not is_public(a) and not self.policy.private_allowed(a)]
         return f"{host} resolves to a non-public address ({bad[0]})" if bad else ""
+
+    async def pinned_address(self, host: str, port: int) -> str:
+        """Resolve once, check, and return the address to connect to — the
+        connection must go to the address that was checked (no DNS rebinding)."""
+        if _is_ip(host):
+            refusal = self._literal_refusal(host)
+            if refusal:
+                raise PermissionError(refusal)
+            return host.strip("[]")
+        addrs = await self._resolver(host, port)
+        if not addrs:
+            raise PermissionError(f"{host} did not resolve")
+        bad = [a for a in addrs if not is_public(a) and not self.policy.private_allowed(a)]
+        if bad:
+            raise PermissionError(f"{host} resolves to a non-public address ({bad[0]})")
+        return addrs[0]
 
 
 def _is_ip(host: str) -> bool:
@@ -262,7 +325,7 @@ def from_env() -> EgressPolicy | None:
         raise SystemExit("egress policy: refusing to start without PROXY_EGRESS_ADMIN_TOKEN")
     with open(path) as f:
         policy = Policy.from_dict(json.load(f))
-    return EgressPolicy(policy, token,
+    return EgressPolicy(policy, token, taint_token=os.environ.get("PROXY_EGRESS_TAINT_TOKEN", ""),
                         ask_timeout=float(os.environ.get("PROXY_EGRESS_ASK_TIMEOUT", "120")),
                         allow_ttl=float(os.environ.get("PROXY_EGRESS_ALLOW_TTL", "600")))
 
@@ -282,12 +345,23 @@ async def handle_admin(egress: EgressPolicy, reader, writer) -> None:
         method, path, _ = lines[0].split(" ", 2)
         headers = {k.strip().lower(): v.strip() for k, _, v in (ln.partition(":") for ln in lines[1:])}
         token = headers.get("authorization", "").removeprefix("Bearer ").strip()
-        if not egress.admin_token or not hmac.compare_digest(token, egress.admin_token):
+        if egress.admin_token and hmac.compare_digest(token, egress.admin_token):
+            role = "admin"
+        elif egress.taint_token and hmac.compare_digest(token, egress.taint_token):
+            role = "taint"
+        else:
             await _json(writer, 401, {"error": "unauthorized"})
             return
         length = int(headers.get("content-length") or 0)
         raw = leftover + (await reader.readexactly(length - len(leftover)) if length > len(leftover) else b"")
         body = json.loads(raw[:length]) if length else {}
+        if role == "taint":
+            if method == "POST" and path == "/taint" and body.get("tainted"):
+                egress.set_taint(True, str(body.get("reason", "")), body.get("ttl"), raise_only=True)
+                await _json(writer, 200, {"tainted": egress.tainted})
+            else:
+                await _json(writer, 403, {"error": "the taint token can only raise taint"})
+            return
         if method == "GET" and path == "/status":
             await _json(writer, 200, {"tainted": egress.tainted, "taint_reason": egress.taint_reason,
                                       "pending": len(egress._pending)})

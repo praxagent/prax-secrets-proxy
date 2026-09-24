@@ -72,7 +72,8 @@ services:
       # denied or held for a person (secrets_proxy/egress_policy.py). Unset = pass
       # unknown destinations through, as before.
       - PROXY_EGRESS_POLICY=${PROXY_EGRESS_POLICY:-}
-      - PROXY_EGRESS_ADMIN_TOKEN=${PROXY_EGRESS_ADMIN_TOKEN:-}
+      - PROXY_EGRESS_ADMIN_TOKEN=${PROXY_EGRESS_ADMIN_TOKEN:-}   # for TeamWork's relay, never the agent
+      - PROXY_EGRESS_TAINT_TOKEN=${PROXY_EGRESS_TAINT_TOKEN:-}   # the agent's: raise-only
       - PROXY_EGRESS_ASK_TIMEOUT=${PROXY_EGRESS_ASK_TIMEOUT:-120}
     volumes:
       - ./secrets_proxy:/addon/secrets_proxy:ro   # the addon + injector
