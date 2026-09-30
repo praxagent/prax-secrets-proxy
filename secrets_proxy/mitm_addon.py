@@ -115,10 +115,12 @@ async def request(flow) -> None:  # noqa: ANN001 - mitmproxy passes an http.HTTP
             logger.warning("[forward] 407 %s (bad or missing proxy credentials)", host)
             flow.response = _unauthorized()
             return
-    # Remember who called before the credential is stripped: the wire record
-    # attributes each response to a caller (dev and prod may share this proxy).
+    # Remember who called before the credential is stripped: the audit line
+    # below and the wire record attribute each request to a caller (dev and
+    # prod may share this proxy). Read after the strip, it is always "-".
+    caller = _caller_label(req.headers)
     try:
-        flow.metadata["caller"] = _caller_label(req.headers)
+        flow.metadata["caller"] = caller
     except (AttributeError, TypeError):
         pass
     # Strip the proxy credential regardless: it authenticates the caller to US
@@ -166,7 +168,7 @@ async def request(flow) -> None:  # noqa: ANN001 - mitmproxy passes an http.HTTP
     # Audit carries WHO, so injections are attributable to a caller rather than
     # anonymous. Never the key, never the body.
     logger.info("[forward] injected %s @ %s (caller=%s)",
-                rule.scheme, host, _caller_label(req.headers))
+                rule.scheme, host, caller)
 
 
 def response(flow) -> None:  # noqa: ANN001 - mitmproxy passes an http.HTTPFlow

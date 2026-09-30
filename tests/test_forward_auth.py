@@ -172,6 +172,28 @@ class TestCredentialHygiene:
         assert "secret" not in label
 
 
+    def test_audit_line_names_the_caller(self, addon, caplog):
+        """The credential is stripped before injection, so the audit line must
+        use the caller read beforehand — reading it after gave "caller=-"."""
+        m = addon("secret")
+
+        class _Rule:
+            scheme = "bearer"
+
+        class _Injector:
+            def rule_for(self, host):
+                return _Rule()
+
+            def inject(self, host, headers, query):
+                return headers, query
+
+        m._injector = _Injector()
+        f = _Flow("api.openai.com", basic("prax-prod", "secret"))
+        with caplog.at_level("INFO"):
+            asyncio.run(m.request(f))
+        assert "caller=prax-prod" in caplog.text
+
+
 class TestUnconfiguredStaysOpenButLoud:
     def test_no_token_means_no_enforcement(self, addon):
         """Back-compat: an existing deployment must not break on upgrade."""
