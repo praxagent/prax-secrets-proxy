@@ -25,6 +25,7 @@ import base64
 import hmac
 import logging
 import os
+import weakref
 from urllib.parse import parse_qsl, urlencode
 
 from secrets_proxy.forward_inject import ForwardInjector
@@ -53,6 +54,39 @@ _ADMIN_PORT = int(os.environ.get("PROXY_EGRESS_ADMIN_PORT", "8791"))
 # because of how someone happened to publish its port is not safe.
 _AUTH_TOKEN = os.environ.get("PROXY_FORWARD_AUTH_TOKEN") or ""
 _AUTH_REALM = "prax-forward-proxy"
+
+# For HTTPS the credential arrives ONCE, on the CONNECT; the requests tunnelled
+# through it carry none. So the CONNECT is authenticated (http_connect) and the
+# caller remembered per client connection — without this, a configured token
+# refused every HTTPS request, right token or not (found live 2026-09-30).
+# Same shape as mitmproxy's own proxyauth addon.
+_tunnel_callers: weakref.WeakKeyDictionary = weakref.WeakKeyDictionary()
+
+
+def _authenticated(headers) -> bool:  # noqa: ANN001
+    return not _AUTH_TOKEN or hmac.compare_digest(_presented_token(headers), _AUTH_TOKEN)
+
+
+def http_connect(flow) -> None:  # noqa: ANN001 - mitmproxy passes the CONNECT's HTTPFlow
+    """mitmproxy hook: authenticate a tunnel once, at the CONNECT."""
+    req = flow.request
+    if not _authenticated(req.headers):
+        logger.warning("[forward] 407 CONNECT %s (bad or missing proxy credentials)",
+                       req.pretty_host)
+        flow.response = _unauthorized()
+        return
+    _tunnel_callers[flow.client_conn] = _caller_label(req.headers)
+    if "Proxy-Authorization" in req.headers:
+        del req.headers["Proxy-Authorization"]
+
+
+def _tunnel_caller(flow) -> str | None:  # noqa: ANN001
+    """The caller authenticated at this connection's CONNECT, if any."""
+    conn = getattr(flow, "client_conn", None)
+    try:
+        return _tunnel_callers.get(conn) if conn is not None else None
+    except TypeError:  # not weak-referenceable (a test double)
+        return None
 
 
 def _presented_token(headers) -> str:  # noqa: ANN001 - mitmproxy Headers
@@ -104,12 +138,16 @@ async def request(flow) -> None:  # noqa: ANN001 - mitmproxy passes an http.HTTP
 
     # Authenticate BEFORE looking at the rule, so an unauthenticated caller
     # cannot use response timing to learn which hosts are injection targets.
-    if _AUTH_TOKEN:
-        presented = _presented_token(req.headers)
-        if not hmac.compare_digest(presented, _AUTH_TOKEN):
+    # Inside an HTTPS tunnel the CONNECT was already authenticated; a plain-HTTP
+    # request carries its own credential. Read the caller now: the credential
+    # is stripped below (reading it afterwards always gave "caller=-").
+    caller = _tunnel_caller(flow)
+    if caller is None:
+        if not _authenticated(req.headers):
             logger.warning("[forward] 407 %s (bad or missing proxy credentials)", host)
             flow.response = _unauthorized()
             return
+        caller = _caller_label(req.headers)
     # Strip the proxy credential regardless: it authenticates the caller to US
     # and must never travel on to the provider.
     if "Proxy-Authorization" in req.headers:
@@ -155,7 +193,7 @@ async def request(flow) -> None:  # noqa: ANN001 - mitmproxy passes an http.HTTP
     # Audit carries WHO, so injections are attributable to a caller rather than
     # anonymous. Never the key, never the body.
     logger.info("[forward] injected %s @ %s (caller=%s)",
-                rule.scheme, host, _caller_label(req.headers))
+                rule.scheme, host, caller)
 
 
 def _unauthorized():  # noqa: ANN202 - mitmproxy Response
