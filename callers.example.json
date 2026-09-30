@@ -1,0 +1,7 @@
+{
+  "_comment": "Per-program identities (PROXY_FORWARD_CALLERS). Hashes only: generate each entry with `python -m secrets_proxy.callers new NAME`, give the printed token to that program alone (HTTPS_PROXY=http://NAME:TOKEN@proxy:8786), and paste the entry here. The main PROXY_FORWARD_AUTH_TOKEN identifies as PROXY_FORWARD_AUTH_NAME (default prax). The hashes below are placeholders that match no token.",
+  "callers": {
+    "sandbox": {"token_sha256": "0000000000000000000000000000000000000000000000000000000000000000"},
+    "browser": {"token_sha256": "1111111111111111111111111111111111111111111111111111111111111111"}
+  }
+}

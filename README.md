@@ -289,6 +289,47 @@ rules add risky access".
   again after private data was read), plus "any other host" to cover the
   defaults.
 
+### Per-program rules — opt-in
+
+Idea credit: NVIDIA OpenShell, whose network policy is per program.
+
+**Give each program its own token.** Run
+`python -m secrets_proxy.callers new sandbox`, give the printed token to that
+program alone (`HTTPS_PROXY=http://sandbox:<token>@proxy:8786`), and put the
+printed entry in a callers file (see `callers.example.json`). Then set
+`PROXY_FORWARD_CALLERS=/config/callers.json`, with `PROXY_FORWARD_CALLERS_FILE`
+pointing at your copy. The file holds only hashes. The main
+`PROXY_FORWARD_AUTH_TOKEN` keeps working, and identifies as
+`PROXY_FORWARD_AUTH_NAME` (default `prax`).
+
+**How a request is identified.** Its identity is the name of the token it
+presented. The Basic username is **not** used, because anyone holding any
+token can set it to anything.
+
+**Name programs in rules.** A rule with `"callers": [...]` applies only to
+those programs. This works in the policy and in the ceiling alike:
+
+    {"host": "api.openai.com", "callers": ["prax"], "action": "allow"},
+    {"host": "pypi.org", "callers": ["sandbox"], "methods": ["GET"], "action": "allow"}
+
+- **Only one program can spend a key.** Allow a credential's host for `prax`
+  alone, and no other program can use that credential, even through the same
+  proxy.
+- **Questions carry the program.** A question shows which program asked
+  (`caller` in `GET /pending`), and a person's answer covers that program
+  only.
+- **`diff` reports per program.** It says which program a change opens a
+  request for ("`POST api.openai.com/ by sandbox`").
+- **Rules fail closed.** A rule naming programs never matches a request with
+  no identity, so those requests fall through to later rules and the default.
+
+**Honest limit.** An identity is only as separate as its token. Programs that
+share an environment (one container, one user) can read each other's tokens.
+This therefore separates *components* (the harness, the sandbox shell, the
+browser), not individual processes inside one of them. OpenShell's supervisor
+attributes each connection to the binary that opened it. That is the stronger
+form, and it is not built here.
+
 ## Production
 
 - Front it with a real WSGI server, not the Flask dev server (the Docker image does

@@ -22,7 +22,6 @@ request body and holds every key. It MUST run locked-down and isolated from Prax
 from __future__ import annotations
 
 import base64
-import hmac
 import logging
 import os
 import weakref
@@ -52,8 +51,15 @@ _ADMIN_PORT = int(os.environ.get("PROXY_EGRESS_ADMIN_PORT", "8791"))
 # and the absence of any per-caller attribution, not a remote hole. Fixed
 # anyway: the topology is a deployment choice, and a proxy that is safe only
 # because of how someone happened to publish its port is not safe.
-_AUTH_TOKEN = os.environ.get("PROXY_FORWARD_AUTH_TOKEN") or ""
 _AUTH_REALM = "prax-forward-proxy"
+
+# Per-program identities (PROXY_FORWARD_CALLERS, secrets_proxy/callers.py): the
+# main PROXY_FORWARD_AUTH_TOKEN is "prax"; each program in the callers file has
+# its own token. The identity is WHOSE TOKEN MATCHED — never the free-form
+# username — so egress rules can differ by program.
+from secrets_proxy.callers import Callers  # noqa: E402
+
+_callers = Callers.from_env()
 
 # For HTTPS the credential arrives ONCE, on the CONNECT; the requests tunnelled
 # through it carry none. So the CONNECT is authenticated (http_connect) and the
@@ -63,24 +69,34 @@ _AUTH_REALM = "prax-forward-proxy"
 _tunnel_callers: weakref.WeakKeyDictionary = weakref.WeakKeyDictionary()
 
 
-def _authenticated(headers) -> bool:  # noqa: ANN001
-    return not _AUTH_TOKEN or hmac.compare_digest(_presented_token(headers), _AUTH_TOKEN)
+def _authenticate(headers) -> tuple[str, str] | None:  # noqa: ANN001
+    """(identity, audit label) of whoever presented these credentials, or None
+    when credentials are required and these match none. identity is "" when
+    none are configured."""
+    identity = _callers.identify(_presented_token(headers)) or ""
+    if _callers.required and not identity:
+        return None
+    # A program from the callers file is labelled by its identity; the main
+    # token keeps its free-form username (dev and prod share it, e.g. prax-prod).
+    label = identity if identity and identity != _callers.main_name else _caller_label(headers)
+    return identity, label
 
 
 def http_connect(flow) -> None:  # noqa: ANN001 - mitmproxy passes the CONNECT's HTTPFlow
     """mitmproxy hook: authenticate a tunnel once, at the CONNECT."""
     req = flow.request
-    if not _authenticated(req.headers):
+    who = _authenticate(req.headers)
+    if who is None:
         logger.warning("[forward] 407 CONNECT %s (bad or missing proxy credentials)",
                        req.pretty_host)
         flow.response = _unauthorized()
         return
-    _tunnel_callers[flow.client_conn] = _caller_label(req.headers)
+    _tunnel_callers[flow.client_conn] = who
     if "Proxy-Authorization" in req.headers:
         del req.headers["Proxy-Authorization"]
 
 
-def _tunnel_caller(flow) -> str | None:  # noqa: ANN001
+def _tunnel_caller(flow) -> tuple[str, str] | None:  # noqa: ANN001
     """The caller authenticated at this connection's CONNECT, if any."""
     conn = getattr(flow, "client_conn", None)
     try:
@@ -141,13 +157,12 @@ async def request(flow) -> None:  # noqa: ANN001 - mitmproxy passes an http.HTTP
     # Inside an HTTPS tunnel the CONNECT was already authenticated; a plain-HTTP
     # request carries its own credential. Read the caller now: the credential
     # is stripped below (reading it afterwards always gave "caller=-").
-    caller = _tunnel_caller(flow)
-    if caller is None:
-        if not _authenticated(req.headers):
-            logger.warning("[forward] 407 %s (bad or missing proxy credentials)", host)
-            flow.response = _unauthorized()
-            return
-        caller = _caller_label(req.headers)
+    who = _tunnel_caller(flow) or _authenticate(req.headers)
+    if who is None:
+        logger.warning("[forward] 407 %s (bad or missing proxy credentials)", host)
+        flow.response = _unauthorized()
+        return
+    identity, caller = who
     # Strip the proxy credential regardless: it authenticates the caller to US
     # and must never travel on to the provider.
     if "Proxy-Authorization" in req.headers:
@@ -166,9 +181,9 @@ async def request(flow) -> None:  # noqa: ANN001 - mitmproxy passes an http.HTTP
             flow.response = _forbidden(f"Host header {claimed} does not match the destination {target}")
             return
         host = target
-        verdict, why = await _egress.check(host, req.port, req.method, req.path)
-        logger.info("[egress] %s %s %s:%s%s — %s", verdict, req.method, host, req.port,
-                    req.path.split("?", 1)[0][:80], why)
+        verdict, why = await _egress.check(host, req.port, req.method, req.path, caller=identity)
+        logger.info("[egress] %s %s %s:%s%s (%s) — %s", verdict, req.method, host, req.port,
+                    req.path.split("?", 1)[0][:80], caller, why)
         if verdict != "allow":
             flow.response = _forbidden(why)
             return
@@ -211,7 +226,7 @@ def _unauthorized():  # noqa: ANN202 - mitmproxy Response
 
 async def running() -> None:
     """mitmproxy lifecycle hook: warn if running open; start the egress policy."""
-    if not _AUTH_TOKEN:
+    if not _callers.required:
         logger.warning(
             "[forward] PROXY_FORWARD_AUTH_TOKEN is not set — ANY caller that can "
             "reach this listener can spend the real credentials anonymously. "

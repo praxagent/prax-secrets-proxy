@@ -67,6 +67,11 @@ services:
       # own. Clients pass it as http://prax:<token>@host:8786; the username is
       # free-form and lands in the audit line so injections are attributable.
       - PROXY_FORWARD_AUTH_TOKEN=${PROXY_FORWARD_AUTH_TOKEN:-}
+      # Per-program identities (opt-in): PROXY_FORWARD_CALLERS=/config/callers.json
+      # gives each program its own token, and egress rules can name programs in
+      # "callers" (secrets_proxy/callers.py). The main token above is "prax".
+      - PROXY_FORWARD_CALLERS=${PROXY_FORWARD_CALLERS:-}
+      - PROXY_FORWARD_AUTH_NAME=${PROXY_FORWARD_AUTH_NAME:-prax}
       # Egress policy (opt-in): set PROXY_EGRESS_POLICY=/config/egress-policy.json
       # and a PROXY_EGRESS_ADMIN_TOKEN, and every request Prax makes is allowed,
       # denied or held for a person (secrets_proxy/egress_policy.py). Unset = pass
@@ -83,6 +88,7 @@ services:
       - ./forward-map.json:/config/forward-map.json:ro
       - ${PROXY_EGRESS_POLICY_FILE:-./egress-policy.example.json}:/config/egress-policy.json:ro
       - ${PROXY_EGRESS_CEILING_FILE:-./egress-ceiling.example.json}:/config/egress-ceiling.json:ro
+      - ${PROXY_FORWARD_CALLERS_FILE:-./callers.example.json}:/config/callers.json:ro
       - mitm-ca:/home/mitmproxy/.mitmproxy        # persist the generated MITM CA
     ports:
       - "127.0.0.1:8786:8786"

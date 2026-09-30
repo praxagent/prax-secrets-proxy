@@ -53,8 +53,13 @@ class Rule:
     methods: frozenset[str] = frozenset()
     paths: tuple[str, ...] = ()
     clean_only: bool = False
+    # Only these program identities (secrets_proxy/callers.py); empty = every caller.
+    callers: frozenset[str] = frozenset()
 
-    def matches(self, host: str, port: int, method: str, path: str, tainted: bool) -> bool:
+    def matches(self, host: str, port: int, method: str, path: str, tainted: bool,
+                caller: str = "") -> bool:
+        if self.callers and caller not in self.callers:
+            return False
         h, pat = host.lower().rstrip("."), self.host.lower().rstrip(".")
         if pat == "*":
             pass  # any host; narrow it with methods / paths / clean_only
@@ -123,13 +128,15 @@ class Policy:
                 methods=frozenset(str(m).upper() for m in raw.get("methods", [])),
                 paths=tuple(str(p) for p in raw.get("paths", [])),
                 clean_only=bool(raw.get("clean_only", False)),
+                callers=frozenset(str(c) for c in raw.get("callers", [])),
             ))
         nets = tuple(ipaddress.ip_network(str(a), strict=False) for a in data.get("allow_private_addresses", []))
         return cls(default, rules, nets)
 
-    def decide(self, host: str, port: int, method: str, path: str, tainted: bool) -> tuple[str, str]:
+    def decide(self, host: str, port: int, method: str, path: str, tainted: bool,
+               caller: str = "") -> tuple[str, str]:
         for i, rule in enumerate(self.rules):
-            if rule.matches(host, port, method, path, tainted):
+            if rule.matches(host, port, method, path, tainted, caller):
                 return rule.action, f"rule {i} ({rule.host})"
         return self.default, "default"
 
@@ -152,6 +159,7 @@ class _Pending:
     tainted: bool
     future: asyncio.Future
     created: float = field(default_factory=time.monotonic)
+    caller: str = ""
 
 
 class EgressPolicy:
@@ -193,31 +201,38 @@ class EgressPolicy:
             self._tainted_until, self.taint_reason = 0.0, ""
 
     @staticmethod
-    def key(host: str, port: int, method: str, path: str) -> str:
-        return f"{host.lower()}:{port} {method.upper()} {normalize_path(path)}"
+    def key(host: str, port: int, method: str, path: str, caller: str = "") -> str:
+        # Per caller: a person's answer for one program is not an answer for another.
+        who = f"{caller}|" if caller else ""
+        return f"{who}{host.lower()}:{port} {method.upper()} {normalize_path(path)}"
 
-    async def check(self, host: str, port: int, method: str, path: str) -> tuple[str, str]:
-        """``(allow|deny, reason)`` for one request. May wait for a person."""
+    async def check(self, host: str, port: int, method: str, path: str,
+                    caller: str = "") -> tuple[str, str]:
+        """``(allow|deny, reason)`` for one request. May wait for a person.
+
+        *caller* is the authenticated program identity (secrets_proxy/callers.py),
+        matched against rules' ``callers``; empty when identities are not in use.
+        """
         tainted = self.tainted
         if self.ceiling is not None:
-            limit, _ = self.ceiling.decide(host, port, method, path, tainted)
+            limit, _ = self.ceiling.decide(host, port, method, path, tainted, caller)
             if limit != ALLOW:
                 return DENY, "outside the ceiling (PROXY_EGRESS_CEILING)"
-        action, why = self.policy.decide(host, port, method, path, tainted)
+        action, why = self.policy.decide(host, port, method, path, tainted, caller)
         if action == DENY:
             return DENY, why
         literal = self._literal_refusal(host)
         if literal:
             return DENY, literal
         if action == ASK:
-            action, why = await self._asked(host, port, method, path, tainted)
+            action, why = await self._asked(host, port, method, path, tainted, caller)
             if action != ALLOW:
                 return DENY, why
         refusal = await self._resolved_refusal(host, port)
         return (DENY, refusal) if refusal else (ALLOW, why)
 
-    async def _asked(self, host, port, method, path, tainted) -> tuple[str, str]:
-        key = self.key(host, port, method, path)
+    async def _asked(self, host, port, method, path, tainted, caller="") -> tuple[str, str]:
+        key = self.key(host, port, method, path, caller)
         cached = self._decisions.get(key)
         if cached and time.monotonic() < cached[1]:
             action, _, why, granted_tainted = cached
@@ -228,7 +243,7 @@ class EgressPolicy:
         if pending is None:
             pending = _Pending(str(next(self._ids)), key, host, port, method,
                                path.split("?", 1)[0], tainted,
-                               asyncio.get_running_loop().create_future())
+                               asyncio.get_running_loop().create_future(), caller=caller)
             self._pending[pending.id], self._by_key[key] = pending, pending.id
         remaining = max(0.0, self.ask_timeout - (time.monotonic() - pending.created))
         try:
@@ -271,7 +286,7 @@ class EgressPolicy:
     def pending(self) -> list[dict]:
         now = time.monotonic()
         return [{"id": p.id, "host": p.host, "port": p.port, "method": p.method, "path": p.path,
-                 "tainted": p.tainted, "age_seconds": round(now - p.created, 1),
+                 "tainted": p.tainted, "caller": p.caller, "age_seconds": round(now - p.created, 1),
                  "expires_in_seconds": max(0.0, round(self.ask_timeout - (now - p.created), 1))}
                 for p in self._pending.values()]
 
@@ -434,22 +449,26 @@ def _probe_hosts(*policies: Policy) -> list[str]:
 def _probes(*policies: Policy):
     paths = {"/"}
     ports = {443}
+    callers = {""}   # "" = a program no rule names
     for pol in policies:
         for rule in pol.rules:
             paths.update(rule.paths)
             ports.update(rule.ports)
+            callers.update(rule.callers)
     for host in _probe_hosts(*policies):
         for port in sorted(ports):
             for method in _METHODS:
                 for path in sorted(paths):
                     for tainted in (False, True):
-                        yield host, port, method, path, tainted
+                        for caller in sorted(callers):
+                            yield host, port, method, path, tainted, caller
 
 
-def _label(host, port, method, path, tainted) -> str:
+def _label(host, port, method, path, tainted, caller="") -> str:
     who = "any other host" if host == _ANY_HOST else host
     where = f"{who}:{port}" if port != 443 else who
-    return f"{method} {where}{path}" + (" after reading private data" if tainted else "")
+    by = f" by {caller}" if caller else ""
+    return f"{method} {where}{path}{by}" + (" after reading private data" if tainted else "")
 
 
 def diff(old: Policy, new: Policy, *, ceiling: Policy | None = None,
