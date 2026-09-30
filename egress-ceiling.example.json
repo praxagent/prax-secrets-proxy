@@ -1,0 +1,18 @@
+{
+  "_comment": "The outer boundary for Prax's own traffic (PROXY_EGRESS_CEILING). Checked before the policy on every request: anything this doesn't allow is denied outright — never asked about, so no person's answer, timed grant or policy edit can exceed it. Default deny; list only what Prax may EVER reach. Here: its model and service providers, and reading (GET/HEAD) the web.",
+  "default": "deny",
+  "rules": [
+    {"host": "api.openai.com", "action": "allow"},
+    {"host": "api.anthropic.com", "action": "allow"},
+    {"host": "openrouter.ai", "action": "allow"},
+    {"host": "discord.com", "action": "allow"},
+    {"host": "gateway.discord.gg", "action": "allow"},
+    {"host": "*.discord.gg", "action": "allow"},
+    {"host": "cdn.discordapp.com", "action": "allow"},
+    {"host": "api.twilio.com", "action": "allow"},
+    {"host": "api.search.brave.com", "action": "allow"},
+    {"host": "api.tavily.com", "action": "allow"},
+    {"host": "r.jina.ai", "action": "allow"},
+    {"host": "*", "methods": ["GET", "HEAD"], "action": "allow"}
+  ]
+}

@@ -75,6 +75,9 @@ services:
       - PROXY_EGRESS_ADMIN_TOKEN=${PROXY_EGRESS_ADMIN_TOKEN:-}   # for TeamWork's relay, never the agent
       - PROXY_EGRESS_TAINT_TOKEN=${PROXY_EGRESS_TAINT_TOKEN:-}   # the agent's: raise-only
       - PROXY_EGRESS_ASK_TIMEOUT=${PROXY_EGRESS_ASK_TIMEOUT:-120}
+      # Ceiling (opt-in): PROXY_EGRESS_CEILING=/config/egress-ceiling.json — an
+      # outer boundary checked before the policy; outside it is denied, never asked.
+      - PROXY_EGRESS_CEILING=${PROXY_EGRESS_CEILING:-}
     volumes:
       - ./secrets_proxy:/addon/secrets_proxy:ro   # the addon + injector
       - ./forward-map.json:/config/forward-map.json:ro
