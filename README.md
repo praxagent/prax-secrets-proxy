@@ -269,7 +269,7 @@ agent can drop entries. This proxy sits on the model path, outside that
 process. With `PROXY_WIRE_RECORD=/wire/wire.jsonl` it appends one line per
 model response (OpenAI-compatible and Anthropic, streamed or not):
 
-    {"ts","host","path","status","model","request_sha256","response_bytes",
+    {"ts","caller","host","path","status","model","request_sha256","response_bytes",
      "tool_calls":[{"name","args_sha256"}],"prev","hash"}
 
 - **Never text** — tool names, argument hashes and sizes only.
@@ -279,6 +279,9 @@ model response (OpenAI-compatible and Anthropic, streamed or not):
   tamper-*evident*: whoever can rewrite the whole file can rebuild the chain,
   so keep `./wire` writable only by the proxy and copy the head hash off the
   box (your backups) to anchor it.
+- `caller` is the proxy username the client presented
+  (`http://<caller>:<token>@host:8786`), so instances sharing the proxy — dev
+  and prod — can be told apart. Give each its own.
 - Prax's `scripts/check_wire_record.py` compares the record with Prax's own
   traces and lists tool calls on the wire the traces don't show.
 - **Limit:** responses larger than `stream_large_bodies` (1 MB in the compose

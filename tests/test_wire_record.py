@@ -117,6 +117,7 @@ def test_the_addon_records_model_responses_and_never_breaks_them(tmp_path, monke
 
     def flow(host, body, ctype="application/json"):
         return SimpleNamespace(
+            metadata={"caller": "prax-prod"},
             request=SimpleNamespace(host=host, path="/v1/chat/completions", raw_content=b"{}"),
             response=SimpleNamespace(status_code=200, headers={"content-type": ctype}, content=body))
 
@@ -129,5 +130,6 @@ def test_the_addon_records_model_responses_and_never_breaks_them(tmp_path, monke
     lines = (tmp_path / "wire.jsonl").read_text().splitlines()
     assert [json.loads(line)["host"] for line in lines] == ["openrouter.ai", "api.openai.com"]
     assert json.loads(lines[0])["tool_calls"][0]["name"] == "browser_click"
+    assert json.loads(lines[0])["caller"] == "prax-prod"
     monkeypatch.delenv("PROXY_WIRE_RECORD")
     importlib.reload(m)

@@ -9,7 +9,7 @@ compromised agent can drop entries. This proxy sits on the model path and
 outside that process, so with ``PROXY_WIRE_RECORD`` set it appends one line
 per model response:
 
-    {"ts", "host", "path", "status", "model", "request_sha256", "response_bytes",
+    {"ts", "caller", "host", "path", "status", "model", "request_sha256", "response_bytes",
      "tool_calls": [{"name", "args_sha256"}], "prev", "hash"}
 
 - **Never text.** Tool names, argument *hashes* and sizes only — no prompt, no
@@ -157,10 +157,10 @@ class WireRecord:
         return any(host == h or host.endswith("." + h) for h in self.hosts)
 
     def append(self, *, host: str, path: str, status: int, request_body: bytes,
-               response_type: str, response_body: bytes) -> dict:
+               response_type: str, response_body: bytes, caller: str = "") -> dict:
         calls, model = extract(response_type, response_body)
         entry = {
-            "ts": round(time.time(), 3), "host": host, "path": path.split("?", 1)[0],
+            "ts": round(time.time(), 3), "caller": caller, "host": host, "path": path.split("?", 1)[0],
             "status": status, "model": model, "request_sha256": _sha(request_body or b""),
             "response_bytes": len(response_body or b""), "tool_calls": calls,
         }

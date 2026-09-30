@@ -115,6 +115,12 @@ async def request(flow) -> None:  # noqa: ANN001 - mitmproxy passes an http.HTTP
             logger.warning("[forward] 407 %s (bad or missing proxy credentials)", host)
             flow.response = _unauthorized()
             return
+    # Remember who called before the credential is stripped: the wire record
+    # attributes each response to a caller (dev and prod may share this proxy).
+    try:
+        flow.metadata["caller"] = _caller_label(req.headers)
+    except (AttributeError, TypeError):
+        pass
     # Strip the proxy credential regardless: it authenticates the caller to US
     # and must never travel on to the provider.
     if "Proxy-Authorization" in req.headers:
@@ -175,6 +181,7 @@ def response(flow) -> None:  # noqa: ANN001 - mitmproxy passes an http.HTTPFlow
         return
     try:
         entry = _wire.append(
+            caller=str((getattr(flow, "metadata", None) or {}).get("caller", "")),
             host=host, path=flow.request.path, status=flow.response.status_code,
             request_body=flow.request.raw_content or b"",
             response_type=flow.response.headers.get("content-type", ""),
