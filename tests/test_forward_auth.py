@@ -172,6 +172,75 @@ class TestCredentialHygiene:
         assert "secret" not in label
 
 
+class _Conn:
+    """Stands in for mitmproxy's Client: hashable and weak-referenceable."""
+
+
+class _TunnelFlow(_Flow):
+    def __init__(self, host, headers=None, conn=None):
+        super().__init__(host, headers)
+        self.client_conn = conn or _Conn()
+
+
+class TestHttpsTunnels:
+    """HTTPS sends the proxy credential on the CONNECT only. Before this, a
+    configured token refused every HTTPS request, right token or not."""
+
+    def test_an_authenticated_tunnel_carries_its_requests(self, addon):
+        m = addon("secret")
+        conn = _Conn()
+        connect = _TunnelFlow("api.openai.com", basic("prax-prod", "secret"), conn)
+        m.http_connect(connect)
+        assert connect.response is None
+        assert "Proxy-Authorization" not in connect.request.headers
+        inner = _TunnelFlow("api.openai.com", {}, conn)   # no credential inside
+        asyncio.run(m.request(inner))
+        assert inner.response is None
+
+    def test_a_bad_connect_is_refused(self, addon):
+        m = addon("secret")
+        for headers in ({}, basic("prax", "wrong")):
+            connect = _TunnelFlow("api.openai.com", headers)
+            m.http_connect(connect)
+            assert connect.response.status_code == 407
+
+    def test_another_connection_does_not_inherit_a_tunnel(self, addon):
+        m = addon("secret")
+        m.http_connect(_TunnelFlow("api.openai.com", basic("prax", "secret")))
+        stranger = _TunnelFlow("api.openai.com", {})
+        asyncio.run(m.request(stranger))
+        assert stranger.response.status_code == 407
+
+    def test_no_token_configured_keeps_tunnels_open(self, addon):
+        m = addon(None)
+        conn = _Conn()
+        m.http_connect(_TunnelFlow("api.openai.com", {}, conn))
+        inner = _TunnelFlow("api.openai.com", {}, conn)
+        asyncio.run(m.request(inner))
+        assert inner.response is None
+
+    def test_audit_line_names_the_tunnels_caller(self, addon, caplog):
+        m = addon("secret")
+
+        class _Rule:
+            scheme = "bearer"
+
+        class _Injector:
+            def rule_for(self, host):
+                return _Rule()
+
+            def inject(self, host, headers, query):
+                return headers, query
+
+        m._injector = _Injector()
+        conn = _Conn()
+        m.http_connect(_TunnelFlow("api.openai.com", basic("prax-prod", "secret"), conn))
+        with caplog.at_level("INFO"):
+            asyncio.run(m.request(_TunnelFlow("api.openai.com", {}, conn)))
+            asyncio.run(m.request(_Flow("api.openai.com", basic("eval-runner", "secret"))))
+        assert "caller=prax-prod" in caplog.text and "caller=eval-runner" in caplog.text
+
+
 class TestUnconfiguredStaysOpenButLoud:
     def test_no_token_means_no_enforcement(self, addon):
         """Back-compat: an existing deployment must not break on upgrade."""
