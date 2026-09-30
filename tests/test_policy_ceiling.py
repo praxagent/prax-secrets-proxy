@@ -46,6 +46,18 @@ def test_outside_the_ceiling_is_denied_without_asking():
     assert _check(gate, "example.org", "GET")[0] == "allow"
 
 
+def test_a_remembered_allow_cannot_exceed_the_ceiling():
+    import time
+    gate = _gate(NEW, CEILING)
+    key = gate.key("example.org", 443, "POST", "/")
+    gate._decisions[key] = ("allow", time.monotonic() + 600, "a person said yes", False)
+    assert _check(gate, "example.org")[0] == "deny"
+    assert _check(_gate(NEW), "example.org")[0] == "deny"  # sanity: no answer = deny
+    ungated = _gate(NEW)
+    ungated._decisions[key] = ("allow", time.monotonic() + 600, "a person said yes", False)
+    assert _check(ungated, "example.org")[0] == "allow"   # the same answer works without it
+
+
 def test_no_ceiling_keeps_the_prior_behaviour():
     assert _check(_gate(NEW), "pastebin.com")[0] == "allow"
 
