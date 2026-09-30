@@ -32,3 +32,6 @@ build/
 # regenerable + can drift) — not committed:
 #   python -m prax.services.credential_registry --export-forward-map forward-map.json
 forward-map.json
+
+# Wire record (runtime data: never commit)
+wire/

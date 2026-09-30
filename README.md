@@ -259,6 +259,31 @@ poller:
 - a process under the loopback-only restriction could not connect directly,
   but could through the proxy.
 
+## Wire record — opt-in: what the agent actually asked the model
+
+Idea credit: NVIDIA's Open Agent Safety Platform (monitoring "on the node's
+only path to the model", out of the agent's reach).
+
+An agent's own audit log lives in the process it audits, so a compromised
+agent can drop entries. This proxy sits on the model path, outside that
+process. With `PROXY_WIRE_RECORD=/wire/wire.jsonl` it appends one line per
+model response (OpenAI-compatible and Anthropic, streamed or not):
+
+    {"ts","host","path","status","model","request_sha256","response_bytes",
+     "tool_calls":[{"name","args_sha256"}],"prev","hash"}
+
+- **Never text** — tool names, argument hashes and sizes only.
+- **Hash-chained**: each line covers the previous line's hash, so an edit,
+  deletion or reordering breaks the chain from there
+  (`python -m secrets_proxy.wire_record verify wire/wire.jsonl`). That is
+  tamper-*evident*: whoever can rewrite the whole file can rebuild the chain,
+  so keep `./wire` writable only by the proxy and copy the head hash off the
+  box (your backups) to anchor it.
+- Prax's `scripts/check_wire_record.py` compares the record with Prax's own
+  traces and lists tool calls on the wire the traces don't show.
+- **Limit:** responses larger than `stream_large_bodies` (1 MB in the compose
+  file) stream through without being buffered and are recorded by size only.
+
 ## Production
 
 - Front it with a real WSGI server, not the Flask dev server (the Docker image does
