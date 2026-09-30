@@ -259,6 +259,36 @@ poller:
 - a process under the loopback-only restriction could not connect directly,
   but could through the proxy.
 
+### Ceiling and policy diff — opt-in
+
+Idea credit: NVIDIA OpenShell's policy prover, which requires policies to
+"stay within an allowed access boundary" and flags "whether proposed network
+rules add risky access".
+
+- **Ceiling.** Set `PROXY_EGRESS_CEILING=/config/egress-ceiling.json` and
+  point `PROXY_EGRESS_CEILING_FILE` at your own file (default:
+  `egress-ceiling.example.json`). It uses the same format as the policy, and
+  is usually `"default": "deny"`.
+  - It is checked **before** the policy on every request.
+  - Anything outside it is denied outright and never asked about, so no
+    person's answer, timed grant or later policy edit can exceed it.
+  - At startup the proxy logs every policy rule that reaches past it.
+- **Diff.** Review what a policy change newly allows before you ship it:
+
+      python -m secrets_proxy.egress_policy diff old.json new.json \
+          --ceiling egress-ceiling.json --forward-map forward-map.json
+
+  - It lists each request the new policy allows, or asks about, that the old
+    one didn't.
+  - It marks the ones that would carry an injected credential, and the ones
+    the ceiling will refuse anyway.
+  - It exits 1 when anything opened, so it can gate a deploy.
+
+  **This is not a proof.** It compares the two policies only over the hosts,
+  methods, ports and paths their own rules mention (each checked clean, and
+  again after private data was read), plus "any other host" to cover the
+  defaults.
+
 ## Production
 
 - Front it with a real WSGI server, not the Flask dev server (the Docker image does

@@ -82,6 +82,7 @@ services:
       - ./secrets_proxy:/addon/secrets_proxy:ro   # the addon + injector
       - ./forward-map.json:/config/forward-map.json:ro
       - ${PROXY_EGRESS_POLICY_FILE:-./egress-policy.example.json}:/config/egress-policy.json:ro
+      - ${PROXY_EGRESS_CEILING_FILE:-./egress-ceiling.example.json}:/config/egress-ceiling.json:ro
       - mitm-ca:/home/mitmproxy/.mitmproxy        # persist the generated MITM CA
     ports:
       - "127.0.0.1:8786:8786"
