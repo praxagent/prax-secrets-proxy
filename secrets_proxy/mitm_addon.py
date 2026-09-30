@@ -138,6 +138,14 @@ async def request(flow) -> None:  # noqa: ANN001 - mitmproxy passes an http.HTTP
     rule = _injector.rule_for(host)
     if rule is None:
         return  # not an allow-listed injection target — pass through untouched
+    # Never put a real credential on a cleartext wire: plain http:// to an
+    # injection host goes out WITHOUT it (the upstream will refuse it), exactly
+    # as if no key were configured. Idea credit: Agent Substrate's egress
+    # credential injection, which never injects into cleartext either.
+    if (getattr(req, "scheme", "https") or "").lower() != "https":
+        logger.warning("[forward] NOT injecting %s @ %s: cleartext http (caller=%s)",
+                       rule.scheme, host, _caller_label(req.headers))
+        return
 
     headers = {k: v for k, v in req.headers.items()}
     query = urlencode(list(req.query.items(multi=True)))
