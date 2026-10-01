@@ -226,10 +226,10 @@ class TestHttpsTunnels:
             scheme = "bearer"
 
         class _Injector:
-            def rule_for(self, host):
+            def http_rule_for(self, host, caller=""):
                 return _Rule()
 
-            def inject(self, host, headers, query):
+            def inject(self, host, headers, query, caller=""):
                 return headers, query
 
         m._injector = _Injector()

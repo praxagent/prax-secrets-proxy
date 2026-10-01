@@ -188,13 +188,13 @@ async def request(flow) -> None:  # noqa: ANN001 - mitmproxy passes an http.HTTP
             flow.response = _forbidden(why)
             return
 
-    rule = _injector.rule_for(host)
+    rule = _injector.http_rule_for(host, identity)
     if rule is None:
         return  # not an allow-listed injection target — pass through untouched
 
     headers = {k: v for k, v in req.headers.items()}
     query = urlencode(list(req.query.items(multi=True)))
-    new_headers, new_query = _injector.inject(host, headers, query)
+    new_headers, new_query = _injector.inject(host, headers, query, caller=identity)
 
     removed = {k.lower() for k in headers} - {k.lower() for k in new_headers}
     for k in list(req.headers.keys()):
@@ -296,3 +296,26 @@ def _forbidden(why: str):  # noqa: ANN202 - mitmproxy Response
 
     return http.Response.make(
         403, f"Blocked by the egress policy: {why}\n".encode(), {"Content-Type": "text/plain"})
+
+
+def websocket_message(flow) -> None:  # noqa: ANN001 - mitmproxy passes an http.HTTPFlow
+    """mitmproxy hook: inject a credential into a client->server WebSocket message.
+
+    For protocols that send the credential in a message, not a header: Discord's
+    gateway carries the bot token in IDENTIFY and RESUME (``d.token``). The
+    upgrade request was authenticated and judged like any other request, so the
+    caller is the one remembered for that connection. Only wss (TLS) is touched.
+    """
+    msg = flow.websocket.messages[-1]
+    if not msg.from_client or not msg.is_text:
+        return
+    if (getattr(flow.request, "scheme", "https") or "").lower() != "https":
+        return
+    who = _tunnel_caller(flow) or ("", "-")
+    identity, caller = who
+    new = _injector.inject_ws_text(flow.request.pretty_host, msg.text, identity)
+    if new is not None:
+        msg.text = new
+        logger.info("[forward] injected websocket credential @ %s (caller=%s)",
+                    flow.request.pretty_host, caller)
+

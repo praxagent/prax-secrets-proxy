@@ -330,6 +330,31 @@ browser), not individual processes inside one of them. OpenShell's supervisor
 attributes each connection to the binary that opened it. That is the stronger
 form, and it is not built here.
 
+### WebSocket credentials and one-instance credentials (Discord)
+
+Some protocols carry the credential in a message, not a header. A forward-map
+rule with scheme `ws-json:<path>` sets the credential at that JSON path in
+**client→server WebSocket text messages** to the host (wss only). Discord's
+gateway sends the bot token in IDENTIFY and RESUME at `d.token`; REST wants
+`Authorization: Bot <token>`, which `header:Authorization` with `"prefix": "Bot "`
+covers.
+
+A rule can name the program identities it injects for (`"callers"`). A rule
+marked `"exclusive": true` **must** name them, or the proxy refuses to start: it
+is for a credential exactly one instance may use. Two Prax instances holding a
+Discord bot token both answer every message, so a dev instance with a
+placeholder must never get the real token.
+
+    {"host": "discord.com", "scheme": "header:Authorization", "prefix": "Bot ",
+     "key_env": "DISCORD_BOT_TOKEN", "callers": ["prax-prod"], "exclusive": true},
+    {"host": "discord.gg", "scheme": "ws-json:d.token",
+     "key_env": "DISCORD_BOT_TOKEN", "callers": ["prax-prod"], "exclusive": true}
+
+Verified 2026-10-01 with real discord.py 2.7.1 through this proxy against a fake
+Discord: the named caller logged in and its IDENTIFY carried the injected token;
+another caller got `401` / `LoginFailure` and never reached the gateway. Not yet
+run against Discord itself.
+
 ## Production
 
 - Front it with a real WSGI server, not the Flask dev server (the Docker image does
