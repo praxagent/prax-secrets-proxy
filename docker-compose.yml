@@ -83,8 +83,14 @@ services:
       # Ceiling (opt-in): PROXY_EGRESS_CEILING=/config/egress-ceiling.json — an
       # outer boundary checked before the policy; outside it is denied, never asked.
       - PROXY_EGRESS_CEILING=${PROXY_EGRESS_CEILING:-}
+      # Wire record (opt-in): set PROXY_WIRE_RECORD=/wire/wire.jsonl and every
+      # model response gets one hash-chained line — tool names and argument
+      # hashes, never text (secrets_proxy/wire_record.py). Unset = off.
+      - PROXY_WIRE_RECORD=${PROXY_WIRE_RECORD:-}
+      - PROXY_WIRE_RECORD_HOSTS=${PROXY_WIRE_RECORD_HOSTS:-}
     volumes:
       - ./secrets_proxy:/addon/secrets_proxy:ro   # the addon + injector
+      - ./wire:/wire                              # the wire record, outside the agent's reach
       - ./forward-map.json:/config/forward-map.json:ro
       - ${PROXY_EGRESS_POLICY_FILE:-./egress-policy.example.json}:/config/egress-policy.json:ro
       - ${PROXY_EGRESS_CEILING_FILE:-./egress-ceiling.example.json}:/config/egress-ceiling.json:ro

@@ -36,6 +36,11 @@ _injector = ForwardInjector.from_env()
 from secrets_proxy import egress_policy as _egress_mod  # noqa: E402
 
 _egress = _egress_mod.from_env()
+
+# Wire record — off unless PROXY_WIRE_RECORD is set (secrets_proxy/wire_record.py).
+from secrets_proxy import wire_record as _wire_mod  # noqa: E402
+
+_wire = _wire_mod.from_env()
 _ADMIN_PORT = int(os.environ.get("PROXY_EGRESS_ADMIN_PORT", "8791"))
 
 
@@ -163,6 +168,12 @@ async def request(flow) -> None:  # noqa: ANN001 - mitmproxy passes an http.HTTP
         flow.response = _unauthorized()
         return
     identity, caller = who
+    # The wire record attributes each response to this caller (dev and prod
+    # may share this proxy).
+    try:
+        flow.metadata["caller"] = caller
+    except (AttributeError, TypeError):
+        pass
     # Strip the proxy credential regardless: it authenticates the caller to US
     # and must never travel on to the provider.
     if "Proxy-Authorization" in req.headers:
@@ -217,6 +228,29 @@ async def request(flow) -> None:  # noqa: ANN001 - mitmproxy passes an http.HTTP
     # anonymous. Never the key, never the body.
     logger.info("[forward] injected %s @ %s (caller=%s)",
                 rule.scheme, host, caller)
+
+
+def response(flow) -> None:  # noqa: ANN001 - mitmproxy passes an http.HTTPFlow
+    """mitmproxy hook: append model responses to the wire record (if on).
+
+    Never breaks the response: recording failures are logged and swallowed.
+    """
+    if _wire is None or flow.response is None:
+        return
+    host = (flow.request.host or "").lower()
+    if not _wire.wants(host):
+        return
+    try:
+        entry = _wire.append(
+            caller=str((getattr(flow, "metadata", None) or {}).get("caller", "")),
+            host=host, path=flow.request.path, status=flow.response.status_code,
+            request_body=flow.request.raw_content or b"",
+            response_type=flow.response.headers.get("content-type", ""),
+            response_body=flow.response.content or b"")
+        if entry["tool_calls"]:
+            logger.info("[wire] %s %s -> %d tool call(s)", host, entry["model"], len(entry["tool_calls"]))
+    except Exception:  # noqa: BLE001 - the record must never break a call
+        logger.warning("[wire] could not record a response from %s", host, exc_info=True)
 
 
 def _unauthorized():  # noqa: ANN202 - mitmproxy Response
