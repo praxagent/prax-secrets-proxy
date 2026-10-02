@@ -197,7 +197,7 @@ async def request(flow) -> None:  # noqa: ANN001 - mitmproxy passes an http.HTTP
     # credential injection, which never injects into cleartext either.
     if (getattr(req, "scheme", "https") or "").lower() != "https":
         logger.warning("[forward] NOT injecting %s @ %s: cleartext http (caller=%s)",
-                       rule.scheme, host, _caller_label(req.headers))
+                       rule.scheme, host, caller)
         return
 
     headers = {k: v for k, v in req.headers.items()}
