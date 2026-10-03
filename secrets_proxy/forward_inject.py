@@ -23,8 +23,12 @@ from __future__ import annotations
 import base64
 import json
 import os
+import re
 from dataclasses import dataclass, field
 from urllib.parse import parse_qsl, urlencode
+
+# A dotted JSON path for ws-json:<path>, e.g. d.token.
+_WS_PATH = re.compile(r"[A-Za-z_][A-Za-z0-9_]*(\.[A-Za-z_][A-Za-z0-9_]*)*")
 
 
 @dataclass(frozen=True)
@@ -35,21 +39,45 @@ class ForwardRule:
     also covers ``api.tavily.com``).
     """
     host: str
-    scheme: str                 # bearer | header:<Name> | basic | query:<param>
-    key_env: str | None = None  # env var holding the secret (bearer/header/query)
+    scheme: str                 # bearer | header:<Name> | basic | query:<param> | ws-json:<path>
+    key_env: str | None = None  # env var holding the secret (bearer/header/query/ws-json)
     user_env: str | None = None  # basic auth: username env
     pass_env: str | None = None  # basic auth: password env
     extra_headers: dict[str, str] = field(default_factory=dict)
+    # Prepended to a header:<Name> value, e.g. "Bot " for Discord's REST API.
+    prefix: str = ""
+    # Program identities (secrets_proxy/callers.py) this rule injects for; empty =
+    # every caller. A rule marked ``exclusive`` MUST name callers: it is for a
+    # credential exactly one instance may use (a Discord bot token — two
+    # instances holding it both answer every message).
+    callers: frozenset[str] = frozenset()
+    exclusive: bool = False
 
     def matches(self, host: str) -> bool:
         h = (host or "").lower()
         return h == self.host or h.endswith("." + self.host)
+
+    def serves(self, caller: str) -> bool:
+        return not self.callers or caller in self.callers
+
+    @property
+    def websocket(self) -> bool:
+        """Injected into WebSocket messages, not HTTP requests."""
+        return self.scheme.startswith("ws-json:")
 
 
 class ForwardInjector:
     """Applies the first matching :class:`ForwardRule` to an outgoing request."""
 
     def __init__(self, rules: list[ForwardRule]):
+        for r in rules:
+            if r.exclusive and not r.callers:
+                raise ValueError(
+                    f"forward map: the rule for {r.host} is exclusive (one instance only) "
+                    "and must name its callers — refusing to start rather than hand the "
+                    "credential to every caller")
+            if r.websocket and not _WS_PATH.fullmatch(r.scheme.split(":", 1)[1]):
+                raise ValueError(f"forward map: bad websocket path in {r.scheme!r}")
         # Longest host first so a specific rule wins over a broad suffix.
         self._rules = sorted(rules, key=lambda r: len(r.host), reverse=True)
 
@@ -64,6 +92,9 @@ class ForwardInjector:
                 user_env=d.get("user_env"),
                 pass_env=d.get("pass_env"),
                 extra_headers=d.get("extra_headers") or {},
+                prefix=str(d.get("prefix") or ""),
+                callers=frozenset(str(c) for c in d.get("callers") or ()),
+                exclusive=bool(d.get("exclusive", False)),
             )
             for d in data
         ]
@@ -91,12 +122,46 @@ class ForwardInjector:
             return bool(os.environ.get(rule.user_env or "") or os.environ.get(rule.pass_env or ""))
         return bool(os.environ.get(rule.key_env or ""))
 
-    def rules_for(self, host: str) -> list[ForwardRule]:
-        """ALL rules matching *host*, longest-host first (a host may need several
-        injections — e.g. Google CSE needs both ?key= and ?cx=)."""
-        return [r for r in self._rules if r.matches(host)]
+    def rules_for(self, host: str, caller: str = "") -> list[ForwardRule]:
+        """ALL HTTP rules matching *host* that serve *caller*, longest-host first
+        (a host may need several injections — e.g. Google CSE needs ?key= and ?cx=)."""
+        return [r for r in self._rules if r.matches(host) and not r.websocket and r.serves(caller)]
 
-    def inject(self, host: str, headers: dict[str, str], query: str = "") -> tuple[dict[str, str], str]:
+    def http_rule_for(self, host: str, caller: str = "") -> ForwardRule | None:
+        return next(iter(self.rules_for(host, caller)), None)
+
+    def ws_rules_for(self, host: str, caller: str = "") -> list[ForwardRule]:
+        return [r for r in self._rules if r.matches(host) and r.websocket and r.serves(caller)]
+
+    def inject_ws_text(self, host: str, text: str, caller: str = "") -> str | None:
+        """The client->server WebSocket message with the credential set at each
+        matching rule's JSON path, or None if nothing applied (left untouched).
+
+        For protocols that carry the credential in a message rather than a header
+        — Discord's gateway sends the bot token in IDENTIFY and RESUME as
+        ``d.token``. Only a JSON object that already has the field is changed.
+        """
+        rules = self.ws_rules_for(host, caller)
+        if not rules:
+            return None
+        try:
+            doc = json.loads(text)
+        except ValueError:
+            return None
+        changed = False
+        for rule in rules:
+            key = os.environ.get(rule.key_env or "")
+            *parents, leaf = rule.scheme.split(":", 1)[1].split(".")
+            node = doc
+            for part in parents:
+                node = node.get(part) if isinstance(node, dict) else None
+            if key and isinstance(node, dict) and leaf in node:
+                node[leaf] = rule.prefix + key
+                changed = True
+        return json.dumps(doc, separators=(",", ":")) if changed else None
+
+    def inject(self, host: str, headers: dict[str, str], query: str = "",
+               caller: str = "") -> tuple[dict[str, str], str]:
         """Return (headers, query_string) with the real credential(s) injected.
 
         Applies EVERY matching rule for the host. Any client-supplied value in the
@@ -105,7 +170,7 @@ class ForwardInjector:
         through unchanged.
         """
         out = dict(headers)
-        for rule in self.rules_for(host):
+        for rule in self.rules_for(host, caller):
             query = self._apply(rule, out, query)
         return out, query
 
@@ -123,7 +188,7 @@ class ForwardInjector:
             key = os.environ.get(rule.key_env or "")
             _strip(out, name.lower())
             if key:
-                out[name] = key
+                out[name] = rule.prefix + key
 
         elif scheme == "basic":
             user = os.environ.get(rule.user_env or "") or ""

@@ -259,6 +259,132 @@ poller:
 - a process under the loopback-only restriction could not connect directly,
   but could through the proxy.
 
+### Ceiling and policy diff — opt-in
+
+Idea credit: NVIDIA OpenShell's policy prover, which requires policies to
+"stay within an allowed access boundary" and flags "whether proposed network
+rules add risky access".
+
+- **Ceiling.** Set `PROXY_EGRESS_CEILING=/config/egress-ceiling.json` and
+  point `PROXY_EGRESS_CEILING_FILE` at your own file (default:
+  `egress-ceiling.example.json`). It uses the same format as the policy, and
+  is usually `"default": "deny"`.
+  - It is checked **before** the policy on every request.
+  - Anything outside it is denied outright and never asked about, so no
+    person's answer, timed grant or later policy edit can exceed it.
+  - At startup the proxy logs every policy rule that reaches past it.
+- **Diff.** Review what a policy change newly allows before you ship it:
+
+      python -m secrets_proxy.egress_policy diff old.json new.json \
+          --ceiling egress-ceiling.json --forward-map forward-map.json
+
+  - It lists each request the new policy allows, or asks about, that the old
+    one didn't.
+  - It marks the ones that would carry an injected credential, and the ones
+    the ceiling will refuse anyway.
+  - It exits 1 when anything opened, so it can gate a deploy.
+
+  **This is not a proof.** It compares the two policies only over the hosts,
+  methods, ports and paths their own rules mention (each checked clean, and
+  again after private data was read), plus "any other host" to cover the
+  defaults.
+
+### Per-program rules — opt-in
+
+Idea credit: NVIDIA OpenShell, whose network policy is per program.
+
+**Give each program its own token.** Run
+`python -m secrets_proxy.callers new sandbox`, give the printed token to that
+program alone (`HTTPS_PROXY=http://sandbox:<token>@proxy:8786`), and put the
+printed entry in a callers file (see `callers.example.json`). Then set
+`PROXY_FORWARD_CALLERS=/config/callers.json`, with `PROXY_FORWARD_CALLERS_FILE`
+pointing at your copy. The file holds only hashes. The main
+`PROXY_FORWARD_AUTH_TOKEN` keeps working, and identifies as
+`PROXY_FORWARD_AUTH_NAME` (default `prax`).
+
+**How a request is identified.** Its identity is the name of the token it
+presented. The Basic username is **not** used, because anyone holding any
+token can set it to anything.
+
+**Name programs in rules.** A rule with `"callers": [...]` applies only to
+those programs. This works in the policy and in the ceiling alike:
+
+    {"host": "api.openai.com", "callers": ["prax"], "action": "allow"},
+    {"host": "pypi.org", "callers": ["sandbox"], "methods": ["GET"], "action": "allow"}
+
+- **Only one program can spend a key.** Allow a credential's host for `prax`
+  alone, and no other program can use that credential, even through the same
+  proxy.
+- **Questions carry the program.** A question shows which program asked
+  (`caller` in `GET /pending`), and a person's answer covers that program
+  only.
+- **`diff` reports per program.** It says which program a change opens a
+  request for ("`POST api.openai.com/ by sandbox`").
+- **Rules fail closed.** A rule naming programs never matches a request with
+  no identity, so those requests fall through to later rules and the default.
+
+**Honest limit.** An identity is only as separate as its token. Programs that
+share an environment (one container, one user) can read each other's tokens.
+This therefore separates *components* (the harness, the sandbox shell, the
+browser), not individual processes inside one of them. OpenShell's supervisor
+attributes each connection to the binary that opened it. That is the stronger
+form, and it is not built here.
+
+### WebSocket credentials and one-instance credentials (Discord)
+
+Some protocols carry the credential in a message, not a header. A forward-map
+rule with scheme `ws-json:<path>` sets the credential at that JSON path in
+**client→server WebSocket text messages** to the host (wss only). Discord's
+gateway sends the bot token in IDENTIFY and RESUME at `d.token`; REST wants
+`Authorization: Bot <token>`, which `header:Authorization` with `"prefix": "Bot "`
+covers.
+
+A rule can name the program identities it injects for (`"callers"`). A rule
+marked `"exclusive": true` **must** name them, or the proxy refuses to start: it
+is for a credential exactly one instance may use. Two Prax instances holding a
+Discord bot token both answer every message, so a dev instance with a
+placeholder must never get the real token.
+
+    {"host": "discord.com", "scheme": "header:Authorization", "prefix": "Bot ",
+     "key_env": "DISCORD_BOT_TOKEN", "callers": ["prax-prod"], "exclusive": true},
+    {"host": "discord.gg", "scheme": "ws-json:d.token",
+     "key_env": "DISCORD_BOT_TOKEN", "callers": ["prax-prod"], "exclusive": true}
+
+Verified 2026-10-01 with real discord.py 2.7.1 through this proxy against a fake
+Discord: the named caller logged in and its IDENTIFY carried the injected token;
+another caller got `401` / `LoginFailure` and never reached the gateway. Not yet
+run against Discord itself.
+
+## Wire record — opt-in: what the agent actually asked the model
+
+Idea credit: NVIDIA's Open Agent Safety Platform (monitoring "on the node's
+only path to the model", out of the agent's reach).
+
+An agent's own audit log lives in the process it audits, so a compromised
+agent can drop entries. This proxy sits on the model path, outside that
+process. With `PROXY_WIRE_RECORD=/wire/wire.jsonl` it appends one line per
+model response (OpenAI-compatible and Anthropic, streamed or not):
+
+    {"ts","caller","host","path","status","model","request_sha256","response_bytes",
+     "tool_calls":[{"name","args_sha256"}],"prev","hash"}
+
+- **Never text** — tool names, argument hashes and sizes only.
+- **Hash-chained**: each line covers the previous line's hash, so an edit,
+  deletion or reordering breaks the chain from there
+  (`python -m secrets_proxy.wire_record verify wire/wire.jsonl`). That is
+  tamper-*evident*: whoever can rewrite the whole file can rebuild the chain,
+  so keep `./wire` writable only by the proxy and copy the head hash off the
+  box (your backups) to anchor it.
+- `caller` says which instance made the call, so instances sharing the proxy —
+  dev and prod — can be told apart. With per-program identities it is the
+  name whose token matched (`PROXY_FORWARD_CALLERS`); with only the main
+  token it is the username in `http://<caller>:<token>@host:8786`. Give each
+  instance its own.
+- Prax's `scripts/check_wire_record.py` compares the record with Prax's own
+  traces and lists tool calls on the wire the traces don't show.
+- **Limit:** responses larger than `stream_large_bodies` (1 MB in the compose
+  file) stream through without being buffered and are recorded by size only.
+
 ## Production
 
 - Front it with a real WSGI server, not the Flask dev server (the Docker image does

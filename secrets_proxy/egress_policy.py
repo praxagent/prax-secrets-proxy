@@ -53,8 +53,13 @@ class Rule:
     methods: frozenset[str] = frozenset()
     paths: tuple[str, ...] = ()
     clean_only: bool = False
+    # Only these program identities (secrets_proxy/callers.py); empty = every caller.
+    callers: frozenset[str] = frozenset()
 
-    def matches(self, host: str, port: int, method: str, path: str, tainted: bool) -> bool:
+    def matches(self, host: str, port: int, method: str, path: str, tainted: bool,
+                caller: str = "") -> bool:
+        if self.callers and caller not in self.callers:
+            return False
         h, pat = host.lower().rstrip("."), self.host.lower().rstrip(".")
         if pat == "*":
             pass  # any host; narrow it with methods / paths / clean_only
@@ -123,13 +128,15 @@ class Policy:
                 methods=frozenset(str(m).upper() for m in raw.get("methods", [])),
                 paths=tuple(str(p) for p in raw.get("paths", [])),
                 clean_only=bool(raw.get("clean_only", False)),
+                callers=frozenset(str(c) for c in raw.get("callers", [])),
             ))
         nets = tuple(ipaddress.ip_network(str(a), strict=False) for a in data.get("allow_private_addresses", []))
         return cls(default, rules, nets)
 
-    def decide(self, host: str, port: int, method: str, path: str, tainted: bool) -> tuple[str, str]:
+    def decide(self, host: str, port: int, method: str, path: str, tainted: bool,
+               caller: str = "") -> tuple[str, str]:
         for i, rule in enumerate(self.rules):
-            if rule.matches(host, port, method, path, tainted):
+            if rule.matches(host, port, method, path, tainted, caller):
                 return rule.action, f"rule {i} ({rule.host})"
         return self.default, "default"
 
@@ -152,6 +159,7 @@ class _Pending:
     tainted: bool
     future: asyncio.Future
     created: float = field(default_factory=time.monotonic)
+    caller: str = ""
 
 
 class EgressPolicy:
@@ -159,8 +167,12 @@ class EgressPolicy:
 
     def __init__(self, policy: Policy, admin_token: str, *, ask_timeout: float = 120.0,
                  allow_ttl: float = 600.0, deny_ttl: float = 60.0, taint_ttl: float = 300.0,
-                 resolver=None, taint_token: str = ""):
+                 resolver=None, taint_token: str = "", ceiling: Policy | None = None):
         self.policy = policy
+        # The outer boundary (PROXY_EGRESS_CEILING). Checked first on every
+        # request: outside it is denied outright — never asked about, so no
+        # person's answer, timed grant or policy edit can exceed it.
+        self.ceiling = ceiling
         # Admin: for the relay carrying a PERSON's answers (e.g. TeamWork).
         # Taint: raise-only, for the agent whose traffic is judged — it must
         # never hold the admin token, or it could approve its own requests.
@@ -189,27 +201,38 @@ class EgressPolicy:
             self._tainted_until, self.taint_reason = 0.0, ""
 
     @staticmethod
-    def key(host: str, port: int, method: str, path: str) -> str:
-        return f"{host.lower()}:{port} {method.upper()} {normalize_path(path)}"
+    def key(host: str, port: int, method: str, path: str, caller: str = "") -> str:
+        # Per caller: a person's answer for one program is not an answer for another.
+        who = f"{caller}|" if caller else ""
+        return f"{who}{host.lower()}:{port} {method.upper()} {normalize_path(path)}"
 
-    async def check(self, host: str, port: int, method: str, path: str) -> tuple[str, str]:
-        """``(allow|deny, reason)`` for one request. May wait for a person."""
+    async def check(self, host: str, port: int, method: str, path: str,
+                    caller: str = "") -> tuple[str, str]:
+        """``(allow|deny, reason)`` for one request. May wait for a person.
+
+        *caller* is the authenticated program identity (secrets_proxy/callers.py),
+        matched against rules' ``callers``; empty when identities are not in use.
+        """
         tainted = self.tainted
-        action, why = self.policy.decide(host, port, method, path, tainted)
+        if self.ceiling is not None:
+            limit, _ = self.ceiling.decide(host, port, method, path, tainted, caller)
+            if limit != ALLOW:
+                return DENY, "outside the ceiling (PROXY_EGRESS_CEILING)"
+        action, why = self.policy.decide(host, port, method, path, tainted, caller)
         if action == DENY:
             return DENY, why
         literal = self._literal_refusal(host)
         if literal:
             return DENY, literal
         if action == ASK:
-            action, why = await self._asked(host, port, method, path, tainted)
+            action, why = await self._asked(host, port, method, path, tainted, caller)
             if action != ALLOW:
                 return DENY, why
         refusal = await self._resolved_refusal(host, port)
         return (DENY, refusal) if refusal else (ALLOW, why)
 
-    async def _asked(self, host, port, method, path, tainted) -> tuple[str, str]:
-        key = self.key(host, port, method, path)
+    async def _asked(self, host, port, method, path, tainted, caller="") -> tuple[str, str]:
+        key = self.key(host, port, method, path, caller)
         cached = self._decisions.get(key)
         if cached and time.monotonic() < cached[1]:
             action, _, why, granted_tainted = cached
@@ -220,7 +243,7 @@ class EgressPolicy:
         if pending is None:
             pending = _Pending(str(next(self._ids)), key, host, port, method,
                                path.split("?", 1)[0], tainted,
-                               asyncio.get_running_loop().create_future())
+                               asyncio.get_running_loop().create_future(), caller=caller)
             self._pending[pending.id], self._by_key[key] = pending, pending.id
         remaining = max(0.0, self.ask_timeout - (time.monotonic() - pending.created))
         try:
@@ -263,7 +286,7 @@ class EgressPolicy:
     def pending(self) -> list[dict]:
         now = time.monotonic()
         return [{"id": p.id, "host": p.host, "port": p.port, "method": p.method, "path": p.path,
-                 "tainted": p.tainted, "age_seconds": round(now - p.created, 1),
+                 "tainted": p.tainted, "caller": p.caller, "age_seconds": round(now - p.created, 1),
                  "expires_in_seconds": max(0.0, round(self.ask_timeout - (now - p.created), 1))}
                 for p in self._pending.values()]
 
@@ -325,7 +348,16 @@ def from_env() -> EgressPolicy | None:
         raise SystemExit("egress policy: refusing to start without PROXY_EGRESS_ADMIN_TOKEN")
     with open(path) as f:
         policy = Policy.from_dict(json.load(f))
+    ceiling = None
+    ceiling_path = os.environ.get("PROXY_EGRESS_CEILING", "")
+    if ceiling_path:
+        with open(ceiling_path) as f:
+            ceiling = Policy.from_dict(json.load(f))
+        beyond = exceeding(policy, ceiling)
+        for case in beyond:
+            logger.warning("egress policy: %s is beyond the ceiling and will be refused", case)
     return EgressPolicy(policy, token, taint_token=os.environ.get("PROXY_EGRESS_TAINT_TOKEN", ""),
+                        ceiling=ceiling,
                         ask_timeout=float(os.environ.get("PROXY_EGRESS_ASK_TIMEOUT", "120")),
                         allow_ttl=float(os.environ.get("PROXY_EGRESS_ALLOW_TTL", "600")))
 
@@ -387,3 +419,118 @@ async def _json(writer, status: int, obj) -> None:
     writer.write(f"HTTP/1.1 {status} X\r\nContent-Type: application/json\r\n"
                  f"Content-Length: {len(body)}\r\nConnection: close\r\n\r\n".encode() + body)
     await writer.drain()
+
+
+# --- reviewing a policy change: what does it newly allow? ------------------------
+#
+# Idea credit: NVIDIA OpenShell's policy prover, which checks "whether proposed
+# network rules add risky access" and "stay within an allowed access boundary".
+# This is NOT a proof: it evaluates both policies over the vocabulary their own
+# rules use (every host pattern, method and path they mention, clean and
+# tainted) and reports where the new one is more permissive. A request shape
+# no rule mentions is judged by the defaults, which are compared too.
+
+_RANK = {DENY: 0, ASK: 1, ALLOW: 2}
+_METHODS = ("GET", "HEAD", "POST", "PUT", "PATCH", "DELETE")
+_ANY_HOST = "unlisted-host.example"
+
+
+def _probe_hosts(*policies: Policy) -> list[str]:
+    hosts: set[str] = {_ANY_HOST}
+    for pol in policies:
+        for rule in pol.rules:
+            pat = rule.host.lower().rstrip(".")
+            if pat == "*":
+                continue
+            hosts.add("sub." + pat[2:] if pat.startswith("*.") else pat)
+    return sorted(hosts)
+
+
+def _probes(*policies: Policy):
+    paths = {"/"}
+    ports = {443}
+    callers = {""}   # "" = a program no rule names
+    for pol in policies:
+        for rule in pol.rules:
+            paths.update(rule.paths)
+            ports.update(rule.ports)
+            callers.update(rule.callers)
+    for host in _probe_hosts(*policies):
+        for port in sorted(ports):
+            for method in _METHODS:
+                for path in sorted(paths):
+                    for tainted in (False, True):
+                        for caller in sorted(callers):
+                            yield host, port, method, path, tainted, caller
+
+
+def _label(host, port, method, path, tainted, caller="") -> str:
+    who = "any other host" if host == _ANY_HOST else host
+    where = f"{who}:{port}" if port != 443 else who
+    by = f" by {caller}" if caller else ""
+    return f"{method} {where}{path}{by}" + (" after reading private data" if tainted else "")
+
+
+def diff(old: Policy, new: Policy, *, ceiling: Policy | None = None,
+         credential_hosts: frozenset[str] = frozenset()) -> list[dict]:
+    """Request shapes the NEW policy treats more permissively than the OLD one."""
+    out = []
+    for probe in _probes(old, new, *([ceiling] if ceiling else [])):
+        before, _ = old.decide(*probe)
+        after, why = new.decide(*probe)
+        if _RANK[after] <= _RANK[before]:
+            continue
+        case = {"request": _label(*probe), "was": before, "now": after, "by": why,
+                "credential": probe[0] in credential_hosts}
+        if ceiling is not None and ceiling.decide(*probe)[0] != ALLOW:
+            case["beyond_ceiling"] = True
+        out.append(case)
+    return out
+
+
+def exceeding(policy: Policy, ceiling: Policy) -> list[str]:
+    """Request shapes the policy would allow or ask about that the ceiling forbids."""
+    return [_label(*p) for p in _probes(policy, ceiling)
+            if policy.decide(*p)[0] != DENY and ceiling.decide(*p)[0] != ALLOW]
+
+
+def _cli(argv: list[str]) -> int:
+    import argparse
+
+    ap = argparse.ArgumentParser(prog="python -m secrets_proxy.egress_policy",
+                                 description="Show what a policy change newly allows.")
+    sub = ap.add_subparsers(dest="cmd", required=True)
+    d = sub.add_parser("diff", help="what NEW allows that OLD did not")
+    d.add_argument("old")
+    d.add_argument("new")
+    d.add_argument("--ceiling", default=os.environ.get("PROXY_EGRESS_CEILING") or None)
+    d.add_argument("--forward-map", default=os.environ.get("PROXY_FORWARD_MAP") or None,
+                   help="marks requests that would carry an injected credential")
+    args = ap.parse_args(argv)
+
+    def load(path):
+        with open(path) as f:
+            return Policy.from_dict(json.load(f))
+
+    creds: frozenset[str] = frozenset()
+    if args.forward_map:
+        with open(args.forward_map) as f:
+            fmap = json.load(f)
+        creds = frozenset(str(e.get("host", "")).lower() for e in fmap
+                          if isinstance(e, dict) and e.get("host"))
+    changes = diff(load(args.old), load(args.new),
+                   ceiling=load(args.ceiling) if args.ceiling else None, credential_hosts=creds)
+    if not changes:
+        print("No request is treated more permissively by the new policy.")
+        return 0
+    print(f"{len(changes)} request shape(s) newly allowed or asked about:")
+    for c in changes:
+        flags = (" [carries a credential]" if c["credential"] else "") + (
+            " [beyond the ceiling: will be refused]" if c.get("beyond_ceiling") else "")
+        print(f"  {c['request']}: {c['was']} -> {c['now']} ({c['by']}){flags}")
+    return 1
+
+
+if __name__ == "__main__":
+    import sys
+    raise SystemExit(_cli(sys.argv[1:]))

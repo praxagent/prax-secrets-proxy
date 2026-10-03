@@ -22,9 +22,9 @@ request body and holds every key. It MUST run locked-down and isolated from Prax
 from __future__ import annotations
 
 import base64
-import hmac
 import logging
 import os
+import weakref
 from urllib.parse import parse_qsl, urlencode
 
 from secrets_proxy.forward_inject import ForwardInjector
@@ -36,6 +36,11 @@ _injector = ForwardInjector.from_env()
 from secrets_proxy import egress_policy as _egress_mod  # noqa: E402
 
 _egress = _egress_mod.from_env()
+
+# Wire record — off unless PROXY_WIRE_RECORD is set (secrets_proxy/wire_record.py).
+from secrets_proxy import wire_record as _wire_mod  # noqa: E402
+
+_wire = _wire_mod.from_env()
 _ADMIN_PORT = int(os.environ.get("PROXY_EGRESS_ADMIN_PORT", "8791"))
 
 
@@ -51,8 +56,58 @@ _ADMIN_PORT = int(os.environ.get("PROXY_EGRESS_ADMIN_PORT", "8791"))
 # and the absence of any per-caller attribution, not a remote hole. Fixed
 # anyway: the topology is a deployment choice, and a proxy that is safe only
 # because of how someone happened to publish its port is not safe.
-_AUTH_TOKEN = os.environ.get("PROXY_FORWARD_AUTH_TOKEN") or ""
 _AUTH_REALM = "prax-forward-proxy"
+
+# Per-program identities (PROXY_FORWARD_CALLERS, secrets_proxy/callers.py): the
+# main PROXY_FORWARD_AUTH_TOKEN is "prax"; each program in the callers file has
+# its own token. The identity is WHOSE TOKEN MATCHED — never the free-form
+# username — so egress rules can differ by program.
+from secrets_proxy.callers import Callers  # noqa: E402
+
+_callers = Callers.from_env()
+
+# For HTTPS the credential arrives ONCE, on the CONNECT; the requests tunnelled
+# through it carry none. So the CONNECT is authenticated (http_connect) and the
+# caller remembered per client connection — without this, a configured token
+# refused every HTTPS request, right token or not (found live 2026-09-30).
+# Same shape as mitmproxy's own proxyauth addon.
+_tunnel_callers: weakref.WeakKeyDictionary = weakref.WeakKeyDictionary()
+
+
+def _authenticate(headers) -> tuple[str, str] | None:  # noqa: ANN001
+    """(identity, audit label) of whoever presented these credentials, or None
+    when credentials are required and these match none. identity is "" when
+    none are configured."""
+    identity = _callers.identify(_presented_token(headers)) or ""
+    if _callers.required and not identity:
+        return None
+    # A program from the callers file is labelled by its identity; the main
+    # token keeps its free-form username (dev and prod share it, e.g. prax-prod).
+    label = identity if identity and identity != _callers.main_name else _caller_label(headers)
+    return identity, label
+
+
+def http_connect(flow) -> None:  # noqa: ANN001 - mitmproxy passes the CONNECT's HTTPFlow
+    """mitmproxy hook: authenticate a tunnel once, at the CONNECT."""
+    req = flow.request
+    who = _authenticate(req.headers)
+    if who is None:
+        logger.warning("[forward] 407 CONNECT %s (bad or missing proxy credentials)",
+                       req.pretty_host)
+        flow.response = _unauthorized()
+        return
+    _tunnel_callers[flow.client_conn] = who
+    if "Proxy-Authorization" in req.headers:
+        del req.headers["Proxy-Authorization"]
+
+
+def _tunnel_caller(flow) -> tuple[str, str] | None:  # noqa: ANN001
+    """The caller authenticated at this connection's CONNECT, if any."""
+    conn = getattr(flow, "client_conn", None)
+    try:
+        return _tunnel_callers.get(conn) if conn is not None else None
+    except TypeError:  # not weak-referenceable (a test double)
+        return None
 
 
 def _presented_token(headers) -> str:  # noqa: ANN001 - mitmproxy Headers
@@ -104,12 +159,21 @@ async def request(flow) -> None:  # noqa: ANN001 - mitmproxy passes an http.HTTP
 
     # Authenticate BEFORE looking at the rule, so an unauthenticated caller
     # cannot use response timing to learn which hosts are injection targets.
-    if _AUTH_TOKEN:
-        presented = _presented_token(req.headers)
-        if not hmac.compare_digest(presented, _AUTH_TOKEN):
-            logger.warning("[forward] 407 %s (bad or missing proxy credentials)", host)
-            flow.response = _unauthorized()
-            return
+    # Inside an HTTPS tunnel the CONNECT was already authenticated; a plain-HTTP
+    # request carries its own credential. Read the caller now: the credential
+    # is stripped below (reading it afterwards always gave "caller=-").
+    who = _tunnel_caller(flow) or _authenticate(req.headers)
+    if who is None:
+        logger.warning("[forward] 407 %s (bad or missing proxy credentials)", host)
+        flow.response = _unauthorized()
+        return
+    identity, caller = who
+    # The wire record attributes each response to this caller (dev and prod
+    # may share this proxy).
+    try:
+        flow.metadata["caller"] = caller
+    except (AttributeError, TypeError):
+        pass
     # Strip the proxy credential regardless: it authenticates the caller to US
     # and must never travel on to the provider.
     if "Proxy-Authorization" in req.headers:
@@ -128,20 +192,28 @@ async def request(flow) -> None:  # noqa: ANN001 - mitmproxy passes an http.HTTP
             flow.response = _forbidden(f"Host header {claimed} does not match the destination {target}")
             return
         host = target
-        verdict, why = await _egress.check(host, req.port, req.method, req.path)
-        logger.info("[egress] %s %s %s:%s%s — %s", verdict, req.method, host, req.port,
-                    req.path.split("?", 1)[0][:80], why)
+        verdict, why = await _egress.check(host, req.port, req.method, req.path, caller=identity)
+        logger.info("[egress] %s %s %s:%s%s (%s) — %s", verdict, req.method, host, req.port,
+                    req.path.split("?", 1)[0][:80], caller, why)
         if verdict != "allow":
             flow.response = _forbidden(why)
             return
 
-    rule = _injector.rule_for(host)
+    rule = _injector.http_rule_for(host, identity)
     if rule is None:
         return  # not an allow-listed injection target — pass through untouched
+    # Never put a real credential on a cleartext wire: plain http:// to an
+    # injection host goes out WITHOUT it (the upstream will refuse it), exactly
+    # as if no key were configured. Idea credit: Agent Substrate's egress
+    # credential injection, which never injects into cleartext either.
+    if (getattr(req, "scheme", "https") or "").lower() != "https":
+        logger.warning("[forward] NOT injecting %s @ %s: cleartext http (caller=%s)",
+                       rule.scheme, host, caller)
+        return
 
     headers = {k: v for k, v in req.headers.items()}
     query = urlencode(list(req.query.items(multi=True)))
-    new_headers, new_query = _injector.inject(host, headers, query)
+    new_headers, new_query = _injector.inject(host, headers, query, caller=identity)
 
     removed = {k.lower() for k in headers} - {k.lower() for k in new_headers}
     for k in list(req.headers.keys()):
@@ -155,7 +227,30 @@ async def request(flow) -> None:  # noqa: ANN001 - mitmproxy passes an http.HTTP
     # Audit carries WHO, so injections are attributable to a caller rather than
     # anonymous. Never the key, never the body.
     logger.info("[forward] injected %s @ %s (caller=%s)",
-                rule.scheme, host, _caller_label(req.headers))
+                rule.scheme, host, caller)
+
+
+def response(flow) -> None:  # noqa: ANN001 - mitmproxy passes an http.HTTPFlow
+    """mitmproxy hook: append model responses to the wire record (if on).
+
+    Never breaks the response: recording failures are logged and swallowed.
+    """
+    if _wire is None or flow.response is None:
+        return
+    host = (flow.request.host or "").lower()
+    if not _wire.wants(host):
+        return
+    try:
+        entry = _wire.append(
+            caller=str((getattr(flow, "metadata", None) or {}).get("caller", "")),
+            host=host, path=flow.request.path, status=flow.response.status_code,
+            request_body=flow.request.raw_content or b"",
+            response_type=flow.response.headers.get("content-type", ""),
+            response_body=flow.response.content or b"")
+        if entry["tool_calls"]:
+            logger.info("[wire] %s %s -> %d tool call(s)", host, entry["model"], len(entry["tool_calls"]))
+    except Exception:  # noqa: BLE001 - the record must never break a call
+        logger.warning("[wire] could not record a response from %s", host, exc_info=True)
 
 
 def _unauthorized():  # noqa: ANN202 - mitmproxy Response
@@ -173,7 +268,7 @@ def _unauthorized():  # noqa: ANN202 - mitmproxy Response
 
 async def running() -> None:
     """mitmproxy lifecycle hook: warn if running open; start the egress policy."""
-    if not _AUTH_TOKEN:
+    if not _callers.required:
         logger.warning(
             "[forward] PROXY_FORWARD_AUTH_TOKEN is not set — ANY caller that can "
             "reach this listener can spend the real credentials anonymously. "
@@ -243,3 +338,26 @@ def _forbidden(why: str):  # noqa: ANN202 - mitmproxy Response
 
     return http.Response.make(
         403, f"Blocked by the egress policy: {why}\n".encode(), {"Content-Type": "text/plain"})
+
+
+def websocket_message(flow) -> None:  # noqa: ANN001 - mitmproxy passes an http.HTTPFlow
+    """mitmproxy hook: inject a credential into a client->server WebSocket message.
+
+    For protocols that send the credential in a message, not a header: Discord's
+    gateway carries the bot token in IDENTIFY and RESUME (``d.token``). The
+    upgrade request was authenticated and judged like any other request, so the
+    caller is the one remembered for that connection. Only wss (TLS) is touched.
+    """
+    msg = flow.websocket.messages[-1]
+    if not msg.from_client or not msg.is_text:
+        return
+    if (getattr(flow.request, "scheme", "https") or "").lower() != "https":
+        return
+    who = _tunnel_caller(flow) or ("", "-")
+    identity, caller = who
+    new = _injector.inject_ws_text(flow.request.pretty_host, msg.text, identity)
+    if new is not None:
+        msg.text = new
+        logger.info("[forward] injected websocket credential @ %s (caller=%s)",
+                    flow.request.pretty_host, caller)
+
